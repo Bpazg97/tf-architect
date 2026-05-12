@@ -17,12 +17,14 @@ var (
 	outputDir  string
 	forceFlag  bool
 	systemFile string
+	version    = "dev"
 )
 
 func main() {
 	root := &cobra.Command{
-		Use:   "tf-architect",
-		Short: "Generate and validate production Terraform IaC from architecture documents",
+		Use:     "tf-architect",
+		Version: version,
+		Short:   "Generate and validate production Terraform IaC from architecture documents",
 		Long: `tf-architect turns architecture documents (PDF, DOCX, MD, TXT) into
 production-grade AWS Terraform — and validates existing Terraform projects.
 

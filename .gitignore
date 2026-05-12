@@ -16,6 +16,10 @@ go.work.sum
 .DS_Store
 Thumbs.db
 
+# Docs
+
+/docs
+
 # Editor
 .vscode/
 .idea/
@@ -37,3 +41,5 @@ docs/generated/
 # Claude / OpenWolf
 .claude
 .wolf
+
+CLAUDE.md
