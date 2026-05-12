@@ -1,0 +1,39 @@
+# Binaries
+tf-architect
+tf-architect-test
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+/vendor/
+
+# Go workspace
+go.work
+go.work.sum
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets / local env
+.env
+.env.*
+*.pem
+*.key
+
+# Generated docs
+docs/generated/
+
+# State files created at runtime
+*.state.json
+
+# Claude / OpenWolf
+.claude
+.wolf
