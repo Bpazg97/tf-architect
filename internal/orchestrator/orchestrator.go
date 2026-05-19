@@ -10,6 +10,7 @@ import (
 	"tf-architect/internal/claude"
 	"tf-architect/internal/docs"
 	"tf-architect/internal/ingestion"
+	"tf-architect/internal/masking"
 	"tf-architect/internal/state"
 	"tf-architect/internal/validation"
 )
@@ -72,8 +73,36 @@ func (o *Orchestrator) Run(docPath string) error {
 		if err != nil {
 			return fmt.Errorf("ingestion: %w", err)
 		}
-		sess.DocMarkdown = conv.Markdown
 		o.status("[%s] ~%d tokens", conv.SourceFormat, conv.EstimatedTokens)
+
+		if o.noMask {
+			o.status("Warning: --no-mask enabled — sensitive values will be sent to Claude")
+			sess.DocMarkdown = conv.Markdown
+		} else {
+			var existingMM masking.MaskMap
+			if sess.MaskMapPath != "" {
+				if mm, loadErr := masking.LoadMaskMap(sess.MaskMapPath); loadErr == nil {
+					existingMM = mm
+				}
+			} else if sess.PreviousDocHash != "" {
+				oldPath := o.stMgr.MaskMapPath(sess.PreviousDocHash)
+				if mm, loadErr := masking.LoadMaskMap(oldPath); loadErr == nil {
+					existingMM = mm
+				}
+			}
+			masked, mm, maskErr := masking.Mask(conv.Markdown, existingMM)
+			if maskErr != nil {
+				return fmt.Errorf("masking document: %w", maskErr)
+			}
+			maskPath := o.stMgr.MaskMapPath(sess.DocHash)
+			if saveErr := masking.SaveMaskMap(maskPath, mm); saveErr != nil {
+				return fmt.Errorf("saving mask map (aborting to prevent data leak): %w", saveErr)
+			}
+			sess.DocMarkdown = masked
+			sess.MaskMapPath = maskPath
+			o.status("Masked %d sensitive values", len(mm))
+		}
+
 		if err := o.stMgr.Advance(sess, state.PhaseAnalyze, state.Checkpoint{}); err != nil {
 			return err
 		}
@@ -225,6 +254,18 @@ func (o *Orchestrator) Run(docPath string) error {
 		}
 		if err := o.stMgr.Advance(sess, state.PhaseValidate, state.Checkpoint{}); err != nil {
 			return err
+		}
+	}
+
+	// ── UNMASK ───────────────────────────────────────────────────────────────
+	if !o.noMask && sess.MaskMapPath != "" {
+		mm, loadErr := masking.LoadMaskMap(sess.MaskMapPath)
+		if loadErr != nil {
+			return fmt.Errorf("loading mask map for unmask: %w", loadErr)
+		}
+		o.status("De-masking generated Terraform files...")
+		if unmaskErr := masking.Unmask(o.outputDir, mm); unmaskErr != nil {
+			o.status("Warning: %v", unmaskErr)
 		}
 	}
 
