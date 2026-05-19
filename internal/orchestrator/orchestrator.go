@@ -22,6 +22,7 @@ type Orchestrator struct {
 	stMgr     *state.Manager
 	workDir   string
 	outputDir string
+	noMask    bool
 
 	// Callbacks wired by the CLI/TUI layer
 	OnQuestion func(questions []string) []string
@@ -29,12 +30,13 @@ type Orchestrator struct {
 	OnChunk    func(chunk string)
 }
 
-func New(workDir, outputDir, systemPrompt string) *Orchestrator {
+func New(workDir, outputDir, systemPrompt string, noMask bool) *Orchestrator {
 	return &Orchestrator{
 		client:    claude.New(workDir, systemPrompt),
 		stMgr:     state.NewManager(workDir),
 		workDir:   workDir,
 		outputDir: outputDir,
+		noMask:    noMask,
 	}
 }
 

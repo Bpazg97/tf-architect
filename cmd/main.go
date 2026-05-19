@@ -17,6 +17,7 @@ var (
 	outputDir  string
 	forceFlag  bool
 	systemFile string
+	noMaskFlag bool
 	version    = "dev"
 )
 
@@ -80,6 +81,7 @@ Supported formats: PDF, DOCX, MD, TXT`,
 	runCmd.Flags().StringVarP(&outputDir, "output", "o", "", "Output directory for Terraform files (default: <docname>-tf/)")
 	runCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force full re-run, ignoring saved session state")
 	runCmd.Flags().StringVar(&systemFile, "system-file", "", "Path to custom system prompt file (default: embedded golden rules)")
+	runCmd.Flags().BoolVar(&noMaskFlag, "no-mask", false, "Disable sensitive value masking (debug only — never use in production)")
 
 	statusCmd := &cobra.Command{
 		Use:   "status <document>",
@@ -175,7 +177,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		systemPrompt = string(data)
 	}
 
-	orch := orchestrator.New(workDir, outputDir, systemPrompt)
+	orch := orchestrator.New(workDir, outputDir, systemPrompt, noMaskFlag)
 
 	orch.OnStatus = func(msg string) {
 		fmt.Println(msg)
