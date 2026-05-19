@@ -162,11 +162,6 @@ func (m *Manager) FindByDocPath(docPath string) (*Session, error) {
 	return latest, nil
 }
 
-// MaskMapPath returns the absolute path to mask.json for a session.
-func (m *Manager) MaskMapPath(docHash string) string {
-	return filepath.Join(m.sessionDir(docHash), "mask.json")
-}
-
 // HashDoc returns the SHA256 hex digest of the file at path.
 func HashDoc(path string) (string, error) {
 	data, err := os.ReadFile(path)
