@@ -16,9 +16,10 @@ go.work.sum
 .DS_Store
 Thumbs.db
 
-# Docs
+# Docs — ignore generated output, keep design docs
 
-/docs
+/docs/*
+!/docs/superpowers/
 
 # Editor
 .vscode/
