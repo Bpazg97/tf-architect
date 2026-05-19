@@ -63,6 +63,13 @@ func (o *Orchestrator) Run(docPath string) error {
 	// ── VALIDATE ONLY ────────────────────────────────────────────────────────
 	if decision.Mode == ModeValidateOnly {
 		o.status("Document unchanged. Re-running validation suite...")
+		if !o.noMask && sess.MaskMapPath != "" {
+			if mm, loadErr := masking.LoadMaskMap(sess.MaskMapPath); loadErr == nil {
+				if unmaskErr := masking.Unmask(o.outputDir, mm); unmaskErr != nil {
+					o.status("Warning: %v", unmaskErr)
+				}
+			}
+		}
 		return o.runValidation(sess)
 	}
 
@@ -101,6 +108,13 @@ func (o *Orchestrator) Run(docPath string) error {
 			sess.DocMarkdown = masked
 			sess.MaskMapPath = maskPath
 			o.status("Masked %d sensitive values", len(mm))
+
+			// Sanitize context blob (may contain diff lines from the new raw document).
+			if decision.ContextBlob != "" {
+				maskedBlob, _, _ := masking.Mask(decision.ContextBlob, mm)
+				decision.ContextBlob = maskedBlob
+				o.client.SetContextBlob(maskedBlob)
+			}
 		}
 
 		if err := o.stMgr.Advance(sess, state.PhaseAnalyze, state.Checkpoint{}); err != nil {
