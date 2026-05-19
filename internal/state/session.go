@@ -80,6 +80,7 @@ type Session struct {
 
 	PreviousDocHash string `json:"previous_doc_hash,omitempty"`
 	DiffSummary     string `json:"diff_summary,omitempty"`
+	MaskMapPath     string `json:"mask_map_path,omitempty"`
 }
 
 type Manager struct {
@@ -169,4 +170,9 @@ func HashDoc(path string) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	return fmt.Sprintf("%x", sum), nil
+}
+
+// MaskMapPath returns the absolute path to mask.json for a session.
+func (m *Manager) MaskMapPath(docHash string) string {
+	return filepath.Join(m.sessionDir(docHash), "mask.json")
 }
