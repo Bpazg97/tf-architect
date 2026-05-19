@@ -148,7 +148,9 @@ locals {
   name = local.project_name
 }
 module.rds.endpoint
-module.vpc.id`
+module.vpc.id
+local.common_tags.name
+local.endpoints.db`
 	masked, mm, err := masking.Mask(input, nil)
 	if err != nil {
 		t.Fatalf("Mask() error: %v", err)
@@ -173,6 +175,12 @@ module.vpc.id`
 	}
 	if !strings.Contains(masked, "module.vpc.id") {
 		t.Error("Terraform module reference module.vpc.id must NOT be masked")
+	}
+	if !strings.Contains(masked, "local.common_tags.name") {
+		t.Error("Terraform local reference local.common_tags.name must NOT be masked")
+	}
+	if !strings.Contains(masked, "local.endpoints.db") {
+		t.Error("Terraform local reference local.endpoints.db must NOT be masked")
 	}
 	if len(mm) != 0 {
 		t.Errorf("expected empty MaskMap, got %v", mm)

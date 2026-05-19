@@ -143,9 +143,6 @@ func (rule *maskRule) apply(text string, s *maskState) string {
 			return match
 		}
 		value := subs[rule.valueGroup]
-		if _, already := s.mm[value]; already {
-			return match
-		}
 		placeholder := s.makePlaceholder(rule.category, rule.format, value)
 		prefix, suffix := "", ""
 		if rule.prefixGroup > 0 && len(subs) > rule.prefixGroup {
