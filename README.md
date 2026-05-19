@@ -6,11 +6,13 @@ Generate and validate production-grade AWS Terraform IaC from architecture docum
 
 Feed `tf-architect` a PDF, DOCX, Markdown, or text document describing your AWS architecture and it will:
 
-1. Analyse the document with Claude
-2. Ask clarifying questions if information is missing
-3. Generate production-grade Terraform modules
-4. Validate the output with `terraform`, `tflint`, `checkov`, and a golden-rules audit
-5. Produce `terraform-docs` documentation
+1. **Mask sensitive values** — ARNs, IPs, account IDs, hostnames, tag values, and emails are replaced with stable placeholders before any text reaches Claude
+2. Analyse the masked document with Claude
+3. Ask clarifying questions if information is missing
+4. Generate production-grade Terraform modules (with placeholders)
+5. **Restore real values** — all generated `.tf` files are de-masked before validation
+6. Validate the output with `terraform`, `tflint`, `checkov`, and a golden-rules audit
+7. Produce `terraform-docs` documentation
 
 Sessions are persisted — interrupted runs resume from the last checkpoint.
 
@@ -73,7 +75,27 @@ tf-architect run architecture.pdf --force
 
 # Use a custom system prompt / golden rules file
 tf-architect run architecture.pdf --system-file ./my-rules.md
+
+# Disable sensitive value masking (debug only — never use in production)
+tf-architect run architecture.pdf --no-mask
 ```
+
+### Sensitive value masking
+
+By default, tf-architect automatically masks sensitive infrastructure values before sending any document content to Claude:
+
+| Category | Example | Placeholder |
+|----------|---------|-------------|
+| AWS ARN | `arn:aws:iam::123456789012:role/my-role` | `arn:aws:RESOURCE_001` |
+| Account ID | `123456789012` | `ACCOUNT_001` |
+| Resource ID | `i-0abc123def`, `vpc-0abc123`, `sg-0abc123` | `RESOURCE_ID_001` |
+| Private CIDR | `10.0.0.0/16`, `192.168.1.0/24` | `CIDR_PRIVATE_001` |
+| Private IP | `10.0.1.5` | `IP_PRIVATE_001` |
+| Hostname / FQDN | `db.internal.company.com` | `HOST_001` |
+| Tag value | `owner = "acme-corp"` | `TAG_VALUE_001` |
+| Email | `ops@company.com` | `EMAIL_001` |
+
+Placeholders are stable — the same value always gets the same placeholder across the entire document. The mapping is stored in `.tf-architect/sessions/<hash>/mask.json` (mode `0600`). After Terraform generation, all `.tf` files are automatically de-masked so real values appear in the final output.
 
 ### Validate a Terraform directory
 
