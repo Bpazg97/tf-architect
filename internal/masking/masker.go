@@ -128,12 +128,15 @@ func parsePlaceholder(ph string) (string, int) {
 func (rule *maskRule) apply(text string, s *maskState) string {
 	if rule.valueGroup == 0 {
 		return rule.re.ReplaceAllStringFunc(text, func(match string) string {
-			if _, already := s.mm[match]; already {
-				return match
+			for _, pfx := range rule.skipPrefixes {
+				if strings.HasPrefix(match, pfx) {
+					return match
+				}
 			}
 			return s.makePlaceholder(rule.category, rule.format, match)
 		})
 	}
+	// context-aware rule: only the value subgroup is sensitive
 	return rule.re.ReplaceAllStringFunc(text, func(match string) string {
 		subs := rule.re.FindStringSubmatch(match)
 		if len(subs) <= rule.valueGroup {

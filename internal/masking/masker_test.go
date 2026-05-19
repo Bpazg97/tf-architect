@@ -146,7 +146,9 @@ variable "owner" {
 }
 locals {
   name = local.project_name
-}`
+}
+module.rds.endpoint
+module.vpc.id`
 	masked, mm, err := masking.Mask(input, nil)
 	if err != nil {
 		t.Fatalf("Mask() error: %v", err)
@@ -166,8 +168,37 @@ locals {
 	if !strings.Contains(masked, "local.project_name") {
 		t.Error("local.project_name must NOT be masked")
 	}
+	if !strings.Contains(masked, "module.rds.endpoint") {
+		t.Error("Terraform module reference module.rds.endpoint must NOT be masked")
+	}
+	if !strings.Contains(masked, "module.vpc.id") {
+		t.Error("Terraform module reference module.vpc.id must NOT be masked")
+	}
 	if len(mm) != 0 {
 		t.Errorf("expected empty MaskMap, got %v", mm)
+	}
+}
+
+func TestMaskFQDN4Label(t *testing.T) {
+	input := `endpoint = "db.prod.internal.example.com"`
+	masked, mm, err := masking.Mask(input, nil)
+	if err != nil {
+		t.Fatalf("Mask() error: %v", err)
+	}
+	if strings.Contains(masked, "db.prod.internal.example.com") {
+		t.Error("4-label FQDN should be masked")
+	}
+	if len(mm) != 1 {
+		t.Fatalf("expected 1 MaskMap entry, got %d: %v", len(mm), mm)
+	}
+	// Placeholder must be the whole FQDN, not a partial match
+	for ph, real := range mm {
+		if real != "db.prod.internal.example.com" {
+			t.Errorf("expected real value %q, got %q", "db.prod.internal.example.com", real)
+		}
+		if strings.Contains(ph, ".") {
+			t.Errorf("placeholder should not contain dots: %q", ph)
+		}
 	}
 }
 

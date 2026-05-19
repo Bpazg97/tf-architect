@@ -3,12 +3,13 @@ package masking
 import "regexp"
 
 type maskRule struct {
-	re          *regexp.Regexp
-	category    string
-	format      string
-	valueGroup  int
-	prefixGroup int
-	suffixGroup int
+	re           *regexp.Regexp
+	category     string
+	format       string
+	valueGroup   int
+	prefixGroup  int
+	suffixGroup  int
+	skipPrefixes []string
 }
 
 var patterns = []maskRule{
@@ -53,9 +54,10 @@ var patterns = []maskRule{
 		format:   "%s",
 	},
 	{
-		re:       regexp.MustCompile(`\b[a-z0-9][a-z0-9\-]*\.[a-z0-9][a-z0-9\-]*\.[a-z]{2,}\b`),
-		category: "HOST",
-		format:   "%s",
+		re:           regexp.MustCompile(`\b(?:[a-z0-9][a-z0-9\-]*\.){2,}[a-z]{2,}\b`),
+		category:     "HOST",
+		format:       "%s",
+		skipPrefixes: []string{"module.", "data.", "each.", "count.", "self.", "path.", "terraform."},
 	},
 	{
 		re:          regexp.MustCompile(`(?i)(bucket(?:_name)?\s*[=:]\s*["'])([^"']+)(["'])`),
