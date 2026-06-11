@@ -18,12 +18,20 @@ import (
 const maxClarifyRounds = 3
 
 // Orchestrator runs the tf-architect FSM.
+//
+// Security invariant: when masking is enabled, every byte sent to Claude
+// (document, context blob, clarification answers, validation errors) and
+// every file Claude can read in outputDir is masked. Files are de-masked
+// exactly once, at the very end of the pipeline, after the last Claude call.
 type Orchestrator struct {
 	client    *claude.Client
 	stMgr     *state.Manager
 	workDir   string
 	outputDir string
 	noMask    bool
+
+	maskMap     masking.MaskMap
+	maskMapPath string
 
 	// Callbacks wired by the CLI/TUI layer
 	OnQuestion func(questions []string) []string
@@ -47,6 +55,24 @@ func (o *Orchestrator) status(format string, args ...interface{}) {
 	}
 }
 
+// maskText masks sensitive values in text using the session mask map,
+// persisting any newly discovered values. Returns text unchanged when
+// masking is disabled or no mask map path is established yet.
+func (o *Orchestrator) maskText(text string) (string, error) {
+	if o.noMask || text == "" || o.maskMapPath == "" {
+		return text, nil
+	}
+	masked, mm, err := masking.Mask(text, o.maskMap)
+	if err != nil {
+		return "", fmt.Errorf("masking text: %w", err)
+	}
+	o.maskMap = mm
+	if err := masking.SaveMaskMap(o.maskMapPath, mm); err != nil {
+		return "", fmt.Errorf("saving mask map (aborting to prevent data leak): %w", err)
+	}
+	return masked, nil
+}
+
 func (o *Orchestrator) Run(docPath string) error {
 	// ── RESUME DECISION ─────────────────────────────────────────────────────
 	decision, err := DecideResume(docPath, o.stMgr)
@@ -56,21 +82,26 @@ func (o *Orchestrator) Run(docPath string) error {
 	sess := decision.Session
 	o.status("Mode: %s | Phase: %s", decision.Mode, sess.CurrentPhase)
 
+	// Restore mask map for resumed sessions so all later text is sanitized
+	// with stable placeholders.
+	if !o.noMask && sess.MaskMapPath != "" {
+		if mm, loadErr := masking.LoadMaskMap(sess.MaskMapPath); loadErr == nil {
+			o.maskMap = mm
+			o.maskMapPath = sess.MaskMapPath
+		}
+	}
 	if decision.ContextBlob != "" {
-		o.client.SetContextBlob(decision.ContextBlob)
+		blob, maskErr := o.maskText(decision.ContextBlob)
+		if maskErr != nil {
+			return maskErr
+		}
+		decision.ContextBlob = blob
 	}
 
 	// ── VALIDATE ONLY ────────────────────────────────────────────────────────
 	if decision.Mode == ModeValidateOnly {
 		o.status("Document unchanged. Re-running validation suite...")
-		if !o.noMask && sess.MaskMapPath != "" {
-			if mm, loadErr := masking.LoadMaskMap(sess.MaskMapPath); loadErr == nil {
-				if unmaskErr := masking.Unmask(o.outputDir, mm); unmaskErr != nil {
-					o.status("Warning: %v", unmaskErr)
-				}
-			}
-		}
-		return o.runValidation(sess)
+		return o.runValidation(sess, false)
 	}
 
 	// ── INGEST ───────────────────────────────────────────────────────────────
@@ -86,12 +117,8 @@ func (o *Orchestrator) Run(docPath string) error {
 			o.status("Warning: --no-mask enabled — sensitive values will be sent to Claude")
 			sess.DocMarkdown = conv.Markdown
 		} else {
-			var existingMM masking.MaskMap
-			if sess.MaskMapPath != "" {
-				if mm, loadErr := masking.LoadMaskMap(sess.MaskMapPath); loadErr == nil {
-					existingMM = mm
-				}
-			} else if sess.PreviousDocHash != "" {
+			existingMM := o.maskMap
+			if existingMM == nil && sess.PreviousDocHash != "" {
 				oldPath := o.stMgr.MaskMapPath(sess.PreviousDocHash)
 				if mm, loadErr := masking.LoadMaskMap(oldPath); loadErr == nil {
 					existingMM = mm
@@ -107,13 +134,17 @@ func (o *Orchestrator) Run(docPath string) error {
 			}
 			sess.DocMarkdown = masked
 			sess.MaskMapPath = maskPath
+			o.maskMap = mm
+			o.maskMapPath = maskPath
 			o.status("Masked %d sensitive values", len(mm))
 
 			// Sanitize context blob (may contain diff lines from the new raw document).
 			if decision.ContextBlob != "" {
-				maskedBlob, _, _ := masking.Mask(decision.ContextBlob, mm)
+				maskedBlob, blobErr := o.maskText(decision.ContextBlob)
+				if blobErr != nil {
+					return blobErr
+				}
 				decision.ContextBlob = maskedBlob
-				o.client.SetContextBlob(maskedBlob)
 			}
 		}
 
@@ -126,13 +157,16 @@ func (o *Orchestrator) Run(docPath string) error {
 	if sess.CurrentPhase.AtOrBefore(state.PhaseAnalyze) {
 		o.status("Analyzing architecture...")
 		var analysisPrompt string
-		if decision.Mode == ModeDocChanged {
+		switch {
+		case decision.Mode == ModeDocChanged:
 			analysisPrompt = fmt.Sprintf(
 				"%s\n\n## CURRENT DOCUMENT (UPDATED):\n%s\n\n"+
 					"Analyze only what changed. Which Terraform resources need modification?",
 				decision.ContextBlob, sess.DocMarkdown,
 			)
-		} else {
+		case decision.Mode == ModeResume && decision.ContextBlob != "":
+			analysisPrompt = decision.ContextBlob + "\n\n---\n\n" + BuildAnalysisPrompt(sess.DocMarkdown)
+		default:
 			analysisPrompt = BuildAnalysisPrompt(sess.DocMarkdown)
 		}
 
@@ -142,6 +176,7 @@ func (o *Orchestrator) Run(docPath string) error {
 			return fmt.Errorf("analyze (state saved): %w", err)
 		}
 		sess.AnalysisJSON = analysisRaw
+		sess.ClaudeSessionID = o.client.GetSessionID()
 		if err := o.stMgr.Advance(sess, state.PhaseClarify, state.Checkpoint{}); err != nil {
 			return err
 		}
@@ -165,6 +200,16 @@ func (o *Orchestrator) Run(docPath string) error {
 				break
 			}
 			answers := o.OnQuestion(questions)
+
+			// Mask answers BEFORE persisting or sending — users type real
+			// CIDRs, account IDs and hostnames here.
+			for i := range answers {
+				masked, maskErr := o.maskText(answers[i])
+				if maskErr != nil {
+					return maskErr
+				}
+				answers[i] = masked
+			}
 
 			// Persist the round before sending to Claude (don't lose user answers on error)
 			cr := state.ClarificationRound{
@@ -198,6 +243,15 @@ func (o *Orchestrator) Run(docPath string) error {
 		o.status("Generating Terraform IaC in %s...", o.outputDir)
 		if err := os.MkdirAll(o.outputDir, 0755); err != nil {
 			return fmt.Errorf("creating output dir: %w", err)
+		}
+
+		// Doc-changed runs edit files left de-masked by the previous completed
+		// run — re-mask them so Claude never reads real values.
+		if decision.Mode == ModeDocChanged && !o.noMask && len(o.maskMap) > 0 {
+			o.status("Re-masking existing Terraform files before AI edits...")
+			if err := masking.MaskDir(o.outputDir, o.maskMap); err != nil {
+				return fmt.Errorf("masking existing files (aborting to prevent data leak): %w", err)
+			}
 		}
 
 		var generatePrompt string
@@ -263,6 +317,7 @@ func (o *Orchestrator) Run(docPath string) error {
 		}
 
 		sess.GeneratedFiles = collectTFFiles(o.outputDir)
+		sess.ClaudeSessionID = o.client.GetSessionID()
 		if len(sess.GeneratedFiles) == 0 {
 			o.status("Warning: no .tf files found in %s — generation may have failed silently", o.outputDir)
 		}
@@ -271,23 +326,14 @@ func (o *Orchestrator) Run(docPath string) error {
 		}
 	}
 
-	// ── UNMASK ───────────────────────────────────────────────────────────────
-	if !o.noMask && sess.MaskMapPath != "" {
-		mm, loadErr := masking.LoadMaskMap(sess.MaskMapPath)
-		if loadErr != nil {
-			return fmt.Errorf("loading mask map for unmask: %w", loadErr)
-		}
-		o.status("De-masking generated Terraform files...")
-		if unmaskErr := masking.Unmask(o.outputDir, mm); unmaskErr != nil {
-			o.status("Warning: %v", unmaskErr)
-		}
-	}
-
 	// ── VALIDATE ─────────────────────────────────────────────────────────────
-	return o.runValidation(sess)
+	// Files stay masked through validation, auto-fix and docs; de-masking
+	// happens once at the end of runValidation, after the last Claude call.
+	filesMasked := !o.noMask && len(o.maskMap) > 0
+	return o.runValidation(sess, filesMasked)
 }
 
-func (o *Orchestrator) runValidation(sess *state.Session) error {
+func (o *Orchestrator) runValidation(sess *state.Session, filesMasked bool) error {
 	o.status("Running validation suite...")
 	suite := validation.New(o.outputDir)
 	results, valErr := suite.Run()
@@ -306,13 +352,37 @@ func (o *Orchestrator) runValidation(sess *state.Session) error {
 		o.status("  %s %s", icon, r.Stage)
 	}
 	run.Passed = valErr == nil
+	// Mask error strings before persisting — validate-only runs operate on
+	// de-masked files, so raw values can appear in tool output.
+	if len(run.Errors) > 0 {
+		maskedErrs, maskErr := o.maskText(strings.Join(run.Errors, "\n"))
+		if maskErr != nil {
+			return maskErr
+		}
+		run.Errors = strings.Split(maskedErrs, "\n")
+	}
 	sess.ValidationRuns = append(sess.ValidationRuns, run)
 
 	if valErr != nil {
 		o.status("Errors detected. Attempting auto-fix...")
+
+		// Auto-fix lets Claude read files in outputDir. If they are currently
+		// de-masked (validate-only path), re-mask them first.
+		if !o.noMask && !filesMasked && len(o.maskMap) > 0 {
+			o.status("Re-masking files before AI auto-fix...")
+			if err := masking.MaskDir(o.outputDir, o.maskMap); err != nil {
+				return fmt.Errorf("masking files before auto-fix (aborting to prevent data leak): %w", err)
+			}
+			filesMasked = true
+		}
+
+		blob, blobErr := o.maskText(buildContextBlob(sess))
+		if blobErr != nil {
+			return blobErr
+		}
 		fixPrompt := fmt.Sprintf(
 			"%s\n\nValidation errors:\n%s\n\nFix all errors in %s. Do not touch files without errors.",
-			buildContextBlob(sess),
+			blob,
 			strings.Join(run.Errors, "\n"),
 			o.outputDir,
 		)
@@ -337,22 +407,39 @@ func (o *Orchestrator) runValidation(sess *state.Session) error {
 		sess.ValidationRuns = append(sess.ValidationRuns, run2)
 		if valErr2 != nil {
 			_ = o.stMgr.Save(sess)
+			o.unmaskOutput(filesMasked)
 			return fmt.Errorf("validation failed after auto-fix: %w", valErr2)
 		}
 	}
 
 	// ── DOCUMENT ─────────────────────────────────────────────────────────────
+	// Runs while files are still masked: the docs prompt instructs Claude to
+	// read resource names/CIDRs from the code.
 	if sess.CurrentPhase != state.PhaseDone {
 		if err := o.stMgr.Advance(sess, state.PhaseDocument, state.Checkpoint{}); err != nil {
 			return err
 		}
-
 		docs.Generate(o.client, sess, o.outputDir, func(msg string) { o.status("%s", msg) })
+	}
 
+	// ── UNMASK (single point, after the last Claude call) ───────────────────
+	o.unmaskOutput(filesMasked)
+
+	if sess.CurrentPhase != state.PhaseDone {
 		_ = o.stMgr.Advance(sess, state.PhaseDone, state.Checkpoint{})
 	}
 	o.status("✓ Session complete — output in %s", o.outputDir)
 	return nil
+}
+
+func (o *Orchestrator) unmaskOutput(filesMasked bool) {
+	if o.noMask || !filesMasked || len(o.maskMap) == 0 {
+		return
+	}
+	o.status("De-masking generated files...")
+	if err := masking.Unmask(o.outputDir, o.maskMap); err != nil {
+		o.status("Warning: %v", err)
+	}
 }
 
 func extractStep(chunk string) string {

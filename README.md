@@ -8,11 +8,11 @@ Feed `tf-architect` a PDF, DOCX, Markdown, or text document describing your AWS 
 
 1. **Mask sensitive values** — ARNs, IPs, account IDs, hostnames, tag values, and emails are replaced with stable placeholders before any text reaches Claude
 2. Analyse the masked document with Claude
-3. Ask clarifying questions if information is missing
+3. Ask clarifying questions if information is missing (answers are masked too)
 4. Generate production-grade Terraform modules (with placeholders)
-5. **Restore real values** — all generated `.tf` files are de-masked before validation
-6. Validate the output with `terraform`, `tflint`, `checkov`, and a golden-rules audit
-7. Produce `terraform-docs` documentation
+5. Validate the output with `terraform`, `tflint`, `checkov`, and a golden-rules audit — files stay masked through validation, AI auto-fix, and documentation, so Claude never reads real values from disk
+6. Produce `terraform-docs` documentation
+7. **Restore real values** — generated `.tf`, `.tfvars`, and `.md` files are de-masked once, after the last AI call
 
 Sessions are persisted — interrupted runs resume from the last checkpoint.
 
@@ -95,7 +95,11 @@ By default, tf-architect automatically masks sensitive infrastructure values bef
 | Tag value | `owner = "acme-corp"` | `TAG_VALUE_001` |
 | Email | `ops@company.com` | `EMAIL_001` |
 
-Placeholders are stable — the same value always gets the same placeholder across the entire document. The mapping is stored in `.tf-architect/sessions/<hash>/mask.json` (mode `0600`). After Terraform generation, all `.tf` files are automatically de-masked so real values appear in the final output.
+Placeholders are stable — the same value always gets the same placeholder across the entire document. The mapping is stored in `.tf-architect/sessions/<hash>/mask.json` (mode `0600`).
+
+**Security invariant:** everything sent to Claude is masked — the document, clarification answers you type, validation errors, and resume context. Files on disk stay masked while Claude can read them (generation, auto-fix, documentation). De-masking of `.tf`, `.tfvars`, and `.md` files happens exactly once, after the last AI call. When a `run` re-edits previously de-masked files (document changed, or auto-fix on a completed session), they are re-masked first.
+
+**Residual risk:** the Claude subprocess runs with `Bash` enabled (needed for `terraform` commands); masking protects content, not the execution environment. Audit `prompts/system.md` and run in an isolated workspace for strict environments.
 
 ### Validate a Terraform directory
 

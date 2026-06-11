@@ -21,6 +21,52 @@ var (
 	version    = "dev"
 )
 
+// ── TUI styling ──────────────────────────────────────────────────────────────
+// Minimal ANSI styling. Disabled when stdout is not a TTY or NO_COLOR is set.
+
+var colorEnabled = func() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}()
+
+const (
+	ansiBold   = "1"
+	ansiDim    = "2"
+	ansiRed    = "31"
+	ansiGreen  = "32"
+	ansiYellow = "33"
+	ansiCyan   = "36"
+)
+
+func paint(code, s string) string {
+	if !colorEnabled {
+		return s
+	}
+	return "\033[" + code + "m" + s + "\033[0m"
+}
+
+// styleStatus colorizes orchestrator status lines by their leading marker.
+func styleStatus(msg string) string {
+	t := strings.TrimSpace(msg)
+	switch {
+	case strings.HasPrefix(t, "✓"):
+		return paint(ansiGreen, msg)
+	case strings.HasPrefix(t, "✗"):
+		return paint(ansiRed, msg)
+	case strings.HasPrefix(t, "Warning"), strings.HasPrefix(t, "⚠"):
+		return paint(ansiYellow, msg)
+	case strings.HasPrefix(t, "──"):
+		return paint(ansiDim, msg)
+	case strings.HasPrefix(t, "Mode:"):
+		return paint(ansiBold, msg)
+	default:
+		return msg
+	}
+}
+
 func main() {
 	root := &cobra.Command{
 		Use:     "tf-architect",
@@ -179,24 +225,30 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	orch := orchestrator.New(workDir, outputDir, systemPrompt, noMaskFlag)
 
+	fmt.Println(paint(ansiBold, "tf-architect ") + paint(ansiDim, version))
+	fmt.Println(paint(ansiDim, strings.Repeat("─", 45)))
+
 	orch.OnStatus = func(msg string) {
-		fmt.Println(msg)
+		fmt.Println(styleStatus(msg))
 	}
 
 	orch.OnChunk = func(chunk string) {
-		fmt.Print(chunk)
+		fmt.Print(paint(ansiDim, chunk))
 	}
 
 	orch.OnQuestion = func(questions []string) []string {
-		fmt.Println("\n── Clarification needed ─────────────────────")
+		fmt.Println("\n" + paint(ansiCyan, "── Clarification needed ─────────────────────"))
 		answers := make([]string, len(questions))
 		reader := bufio.NewReader(os.Stdin)
 		for i, q := range questions {
-			fmt.Printf("\n[%d/%d] %s\n> ", i+1, len(questions), q)
+			fmt.Printf("\n%s %s\n%s ",
+				paint(ansiCyan, fmt.Sprintf("[%d/%d]", i+1, len(questions))),
+				paint(ansiBold, q),
+				paint(ansiCyan, ">"))
 			answer, _ := reader.ReadString('\n')
 			answers[i] = strings.TrimSpace(answer)
 		}
-		fmt.Println("─────────────────────────────────────────────")
+		fmt.Println(paint(ansiCyan, "─────────────────────────────────────────────"))
 		return answers
 	}
 
@@ -231,7 +283,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		docHash = docHash[:12] + "..."
 	}
 	fmt.Printf("Hash:     %s\n", docHash)
-	fmt.Printf("Phase:    %s\n", sess.CurrentPhase)
+	fmt.Printf("Phase:    %s\n", paint(ansiBold, string(sess.CurrentPhase)))
 	fmt.Printf("Created:  %s\n", sess.CreatedAt.Format("2006-01-02 15:04"))
 	fmt.Printf("Updated:  %s\n", sess.UpdatedAt.Format("2006-01-02 15:04"))
 	if sess.LastCheckpoint.GenerateStep != "" {
@@ -242,9 +294,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 	if len(sess.ValidationRuns) > 0 {
 		last := sess.ValidationRuns[len(sess.ValidationRuns)-1]
-		result := "PASSED"
+		result := paint(ansiGreen, "PASSED")
 		if !last.Passed {
-			result = "FAILED"
+			result = paint(ansiRed, "FAILED")
 		}
 		fmt.Printf("Last validation: %s (%s)\n", result, last.RunAt.Format("15:04"))
 	}
@@ -287,16 +339,16 @@ func runValidate(cmd *cobra.Command, args []string) error {
 
 	passed, failed := 0, 0
 	for _, r := range results {
-		icon := "✓"
+		icon := paint(ansiGreen, "✓")
 		if !r.Passed {
-			icon = "✗"
+			icon = paint(ansiRed, "✗")
 			failed++
 		} else {
 			passed++
 		}
 		fmt.Printf("  %s  %s\n", icon, r.Stage)
 		for _, e := range r.Errors {
-			fmt.Printf("       %s\n", e)
+			fmt.Printf("       %s\n", paint(ansiRed, e))
 		}
 		if !r.Passed && r.Output != "" && len(r.Errors) == 0 {
 			// print raw output for stages without structured errors (e.g. tflint)
@@ -307,7 +359,13 @@ func runValidate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Printf("\n%d passed, %d failed\n", passed, failed)
+	summary := fmt.Sprintf("\n%s, %s\n",
+		paint(ansiGreen, fmt.Sprintf("%d passed", passed)),
+		paint(ansiRed, fmt.Sprintf("%d failed", failed)))
+	if failed == 0 {
+		summary = fmt.Sprintf("\n%s\n", paint(ansiGreen, fmt.Sprintf("%d passed, 0 failed", passed)))
+	}
+	fmt.Print(summary)
 	if runErr != nil {
 		return runErr
 	}

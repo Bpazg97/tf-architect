@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"tf-architect/internal/ingestion"
+	"tf-architect/internal/masking"
 	"tf-architect/internal/state"
 )
 
@@ -67,8 +68,17 @@ func DecideResume(docPath string, mgr *state.Manager) (*ResumeDecision, error) {
 		}, nil
 	}
 
-	// CASE 4: Hash changed → document was modified
-	diffSummary := computeMarkdownDiff(prev.DocMarkdown, docPath)
+	// CASE 4: Hash changed → document was modified.
+	// prev.DocMarkdown is stored masked — mask the new document with the
+	// previous mask map before diffing, otherwise every line containing a
+	// sensitive value reports as changed AND raw values leak into DiffSummary.
+	var prevMM masking.MaskMap
+	if prev.MaskMapPath != "" {
+		if mm, loadErr := masking.LoadMaskMap(prev.MaskMapPath); loadErr == nil {
+			prevMM = mm
+		}
+	}
+	diffSummary := computeMarkdownDiff(prev.DocMarkdown, docPath, prevMM)
 	newSession := &state.Session{
 		DocPath:         docPath,
 		DocHash:         currentHash,
@@ -152,12 +162,19 @@ func buildContextBlobForDocChange(prev *state.Session, diffSummary string) strin
 	)
 }
 
-func computeMarkdownDiff(prevMarkdown, newDocPath string) string {
+func computeMarkdownDiff(prevMarkdown, newDocPath string, prevMM masking.MaskMap) string {
 	result, err := ingestion.Convert(newDocPath)
 	if err != nil {
 		return "Unable to compute diff — full re-analysis required"
 	}
 	newMarkdown := result.Markdown
+	if prevMM != nil {
+		// Same patterns + same encounter order = stable placeholders, so the
+		// ingest phase will reproduce identical masking later.
+		if masked, _, maskErr := masking.Mask(newMarkdown, prevMM); maskErr == nil {
+			newMarkdown = masked
+		}
+	}
 
 	prevLines := strings.Split(prevMarkdown, "\n")
 	newLines := strings.Split(newMarkdown, "\n")

@@ -56,6 +56,9 @@ func (c *Client) StreamQuery(prompt string, onChunk func(string)) error {
 	cmd := exec.Command("claude", args...)
 	cmd.Dir = c.workDir
 
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
@@ -122,7 +125,23 @@ func (c *Client) StreamQuery(prompt string, onChunk func(string)) error {
 		return fmt.Errorf("reading claude output: %w", err)
 	}
 
-	return cmd.Wait()
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("claude exited: %w%s", err, formatStderr(stderr.String()))
+	}
+	return nil
+}
+
+// formatStderr returns the tail of stderr for error context (empty if none).
+func formatStderr(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	const max = 500
+	if len(s) > max {
+		s = "..." + s[len(s)-max:]
+	}
+	return " — stderr: " + s
 }
 
 func (c *Client) buildArgs(prompt string) []string {

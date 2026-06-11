@@ -235,3 +235,99 @@ func TestMaskJsonPersist(t *testing.T) {
 		t.Errorf("mask.json should not be group/world readable, mode: %v", info.Mode())
 	}
 }
+
+func TestMaskDirRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	tfContent := `private_ip = "10.0.1.5"
+owner_tag  = "tmobilitat"`
+	tfvarsContent := `account_id = "123456789012"`
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(tfContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "terraform.tfvars"), []byte(tfvarsContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("10.0.1.5"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	mm := masking.MaskMap{
+		"IP_PRIVATE_001": "10.0.1.5",
+		"TAG_VALUE_001":  "tmobilitat",
+		"ACCOUNT_001":    "123456789012",
+	}
+
+	if err := masking.MaskDir(dir, mm); err != nil {
+		t.Fatalf("MaskDir() error: %v", err)
+	}
+	tf, _ := os.ReadFile(filepath.Join(dir, "main.tf"))
+	if strings.Contains(string(tf), "10.0.1.5") || strings.Contains(string(tf), "tmobilitat") {
+		t.Errorf("real values still present in .tf after MaskDir:\n%s", tf)
+	}
+	tfvars, _ := os.ReadFile(filepath.Join(dir, "terraform.tfvars"))
+	if strings.Contains(string(tfvars), "123456789012") {
+		t.Errorf("account ID still present in .tfvars after MaskDir:\n%s", tfvars)
+	}
+	txt, _ := os.ReadFile(filepath.Join(dir, "notes.txt"))
+	if !strings.Contains(string(txt), "10.0.1.5") {
+		t.Error("non-masked-suffix file should not be modified by MaskDir")
+	}
+
+	if err := masking.Unmask(dir, mm); err != nil {
+		t.Fatalf("Unmask() error: %v", err)
+	}
+	tf2, _ := os.ReadFile(filepath.Join(dir, "main.tf"))
+	if string(tf2) != tfContent {
+		t.Errorf("round-trip mismatch:\nwant: %s\ngot:  %s", tfContent, tf2)
+	}
+}
+
+func TestUnmaskTfvarsAndMd(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "vars.tfvars"), []byte(`ip = "IP_PRIVATE_001"`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "docs", "ARCHITECTURE.md"), []byte("CIDR: CIDR_PRIVATE_001"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	mm := masking.MaskMap{
+		"IP_PRIVATE_001":   "10.0.1.5",
+		"CIDR_PRIVATE_001": "10.0.0.0/16",
+	}
+	if err := masking.Unmask(dir, mm); err != nil {
+		t.Fatalf("Unmask() error: %v", err)
+	}
+
+	tfvars, _ := os.ReadFile(filepath.Join(dir, "vars.tfvars"))
+	if !strings.Contains(string(tfvars), "10.0.1.5") {
+		t.Error("placeholder not restored in .tfvars")
+	}
+	md, _ := os.ReadFile(filepath.Join(dir, "docs", "ARCHITECTURE.md"))
+	if !strings.Contains(string(md), "10.0.0.0/16") {
+		t.Error("placeholder not restored in nested .md")
+	}
+}
+
+func TestUnmaskPlaceholderPrefixCollision(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"),
+		[]byte("a = \"ACCOUNT_100\"\nb = \"ACCOUNT_1000\""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mm := masking.MaskMap{
+		"ACCOUNT_100":  "111111111111",
+		"ACCOUNT_1000": "222222222222",
+	}
+	if err := masking.Unmask(dir, mm); err != nil {
+		t.Fatalf("Unmask() error: %v", err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "main.tf"))
+	want := "a = \"111111111111\"\nb = \"222222222222\""
+	if string(got) != want {
+		t.Errorf("prefix collision corrupted output:\nwant: %s\ngot:  %s", want, got)
+	}
+}

@@ -115,7 +115,8 @@ func (m *Manager) Load(docHash string) (*Session, error) {
 
 func (m *Manager) Save(s *Session) error {
 	dir := m.sessionDir(s.DocHash)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	// 0700/0600: session.json contains document content and user answers.
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
 	s.UpdatedAt = time.Now()
@@ -123,7 +124,7 @@ func (m *Manager) Save(s *Session) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.sessionPath(s.DocHash), data, 0644)
+	return os.WriteFile(m.sessionPath(s.DocHash), data, 0600)
 }
 
 func (m *Manager) Advance(s *Session, phase Phase, checkpoint Checkpoint) error {
