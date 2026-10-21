@@ -1,9 +1,10 @@
-// Package prompts embeds the default system prompt into the binary.
+// Package prompts embeds the provider-neutral AGENTS.md into the binary.
 package prompts
 
 import _ "embed"
 
-// System is the default system prompt (golden rules).
+// Agents is the provider-neutral prompt: the system prompt for every provider
+// and the base of the AGENTS.md written into generated projects.
 //
-//go:embed system.md
-var System string
+//go:embed AGENTS.md
+var Agents string

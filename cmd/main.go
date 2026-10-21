@@ -228,7 +228,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	systemPrompt := prompts.System
+	systemPrompt := prompts.Agents
 	if systemFile != "" {
 		data, err := os.ReadFile(systemFile)
 		if err != nil {

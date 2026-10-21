@@ -64,10 +64,17 @@ Treat each placeholder as the real value it stands for. Copy it verbatim
 wherever that value is needed. Never alter, split or reformat a placeholder,
 never replace it with an invented value, and never ask for the real value.`
 
-func New(workDir, outputDir, systemPrompt string, noMask bool) *Orchestrator {
-	if !noMask {
-		systemPrompt += maskingNote
+// withMaskingNote appends the placeholder instructions unless masking is off
+// or the system prompt already carries a MASKED VALUES section.
+func withMaskingNote(systemPrompt string, noMask bool) string {
+	if noMask || strings.Contains(systemPrompt, "## MASKED VALUES") {
+		return systemPrompt
 	}
+	return systemPrompt + maskingNote
+}
+
+func New(workDir, outputDir, systemPrompt string, noMask bool) *Orchestrator {
+	systemPrompt = withMaskingNote(systemPrompt, noMask)
 	return &Orchestrator{
 		client:    claude.New(outputDir, systemPrompt),
 		stMgr:     state.NewManager(workDir),
