@@ -1,6 +1,7 @@
 package docs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -23,29 +24,43 @@ type ClarificationEntry struct {
 	Answer   string
 }
 
-// Client is the interface the docs package expects from the Claude client.
+// Client is the interface the docs package expects from the model client.
 type Client interface {
-	Query(prompt string) (string, error)
+	Query(ctx context.Context, prompt string) (string, error)
 }
+
+// agentsHeader opens the generated AGENTS.md. The file is written with real
+// values, so it must not be shared with an AI provider as is.
+const agentsHeader = `> This file contains real infrastructure values. Do not paste it into an AI tool you do not trust, and do not commit it to a public repository.
+
+`
 
 type architecturalDocs struct {
-	RootREADME   string
-	Architecture string
-	Runbook      string
-	Variables    string
+	RootREADME    string
+	Architecture  string
+	Runbook       string
+	Variables     string
+	ProjectAgents string
 }
 
-// GenerateArchitecturalDocs generates the four documentation files via Claude.
-func GenerateArchitecturalDocs(client Client, sess SessionData, outputDir string, onStatus func(string)) error {
+// GenerateArchitecturalDocs generates the documentation files and AGENTS.md
+// via the model. project is the masked rendered project; every file written
+// goes through unmask, so the output directory holds real values.
+func GenerateArchitecturalDocs(ctx context.Context, client Client, sess SessionData, outputDir, agentsBase, project string, unmask func(string) string, onStatus func(string)) error {
 	onStatus("Generating architectural documentation...")
 
-	prompt := buildDocsPrompt(sess, outputDir)
-	raw, err := client.Query(prompt)
+	prompt := buildDocsPrompt(sess, project)
+	raw, err := client.Query(ctx, prompt)
 	if err != nil {
 		return fmt.Errorf("architectural docs generation: %w", err)
 	}
 
 	adocs := parseDocSections(raw)
+	adocs.RootREADME = unmask(adocs.RootREADME)
+	adocs.Architecture = unmask(adocs.Architecture)
+	adocs.Runbook = unmask(adocs.Runbook)
+	adocs.Variables = unmask(adocs.Variables)
+	adocs.ProjectAgents = unmask(adocs.ProjectAgents)
 
 	docsDir := filepath.Join(outputDir, "docs")
 	if err := os.MkdirAll(docsDir, 0755); err != nil {
@@ -60,7 +75,7 @@ func GenerateArchitecturalDocs(client Client, sess SessionData, outputDir string
 	// CHANGELOG.md is maintained manually after the first run.
 	changelog := filepath.Join(docsDir, "CHANGELOG.md")
 	if _, err := os.Stat(changelog); os.IsNotExist(err) {
-		files[changelog] = changelogStub(sess)
+		files[changelog] = unmask(changelogStub(sess))
 	}
 
 	for path, content := range files {
@@ -80,10 +95,28 @@ func GenerateArchitecturalDocs(client Client, sess SessionData, outputDir string
 		onStatus("  ✓ README.md (architectural prefix)")
 	}
 
+	if adocs.ProjectAgents == "" {
+		onStatus("  ⚠ the model returned no project section; AGENTS.md has only the base rules")
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, "AGENTS.md"), []byte(buildAgentsMD(agentsBase, adocs.ProjectAgents)), 0644); err != nil {
+		return fmt.Errorf("writing AGENTS.md: %w", err)
+	}
+	onStatus("  ✓ AGENTS.md")
+
 	return nil
 }
 
-func buildDocsPrompt(sess SessionData, outputDir string) string {
+// buildAgentsMD joins the header, the provider-neutral base and the
+// model-written project section.
+func buildAgentsMD(base, project string) string {
+	out := agentsHeader + base
+	if project != "" {
+		out += "\n\n## Project\n\n" + project + "\n"
+	}
+	return out
+}
+
+func buildDocsPrompt(sess SessionData, project string) string {
 	var tfFileList strings.Builder
 	for _, f := range sess.GeneratedFiles {
 		tfFileList.WriteString("- " + f + "\n")
@@ -94,7 +127,7 @@ func buildDocsPrompt(sess SessionData, outputDir string) string {
 		decisions.WriteString("- **" + c.Question + "**: " + c.Answer + "\n")
 	}
 
-	return `You are a senior infrastructure architect writing documentation for a Terraform project.
+	return "## TASK: DOCS\n\n" + `You are a senior infrastructure architect writing documentation for a Terraform project.
 
 ## Source Document
 ` + sess.DocMarkdown + `
@@ -104,6 +137,8 @@ func buildDocsPrompt(sess SessionData, outputDir string) string {
 
 ## Generated Terraform Files
 ` + tfFileList.String() + `
+## Current Project Files
+` + project + `
 
 ---
 
@@ -143,7 +178,18 @@ Write docs/VARIABLES.md:
 - For each required variable: purpose, accepted values, examples per env (dev/staging/prod)
 - Sensitive variables: how to provide them (env var, tfvars, Secrets Manager)
 - Recommended tfvars structure per environment
-===END_VARIABLES===`
+===END_VARIABLES===
+
+===BEGIN_PROJECT_AGENTS===
+Write the project-specific part of AGENTS.md, for any AI tool that edits this
+repository later (it is appended under a "## Project" heading, so start with
+subsections, not a title):
+- What the project is and its module layout
+- Naming, tagging and variable conventions actually used in the code
+- Where state, environments and sensitive inputs live
+- What to preserve and what to avoid when changing it
+Reference real module paths, resource names and values from the files above.
+===END_PROJECT_AGENTS===`
 }
 
 func parseDocSections(raw string) architecturalDocs {
@@ -157,10 +203,11 @@ func parseDocSections(raw string) architecturalDocs {
 	}
 
 	return architecturalDocs{
-		RootREADME:   extract("===BEGIN_ROOT_README===", "===END_ROOT_README==="),
-		Architecture: extract("===BEGIN_ARCHITECTURE===", "===END_ARCHITECTURE==="),
-		Runbook:      extract("===BEGIN_RUNBOOK===", "===END_RUNBOOK==="),
-		Variables:    extract("===BEGIN_VARIABLES===", "===END_VARIABLES==="),
+		RootREADME:    extract("===BEGIN_ROOT_README===", "===END_ROOT_README==="),
+		Architecture:  extract("===BEGIN_ARCHITECTURE===", "===END_ARCHITECTURE==="),
+		Runbook:       extract("===BEGIN_RUNBOOK===", "===END_RUNBOOK==="),
+		Variables:     extract("===BEGIN_VARIABLES===", "===END_VARIABLES==="),
+		ProjectAgents: extract("===BEGIN_PROJECT_AGENTS===", "===END_PROJECT_AGENTS==="),
 	}
 }
 

@@ -61,6 +61,9 @@ type Orchestrator struct {
 	workDir   string
 	outputDir string
 	noMask    bool
+	// agentsBase is the system prompt before the masking note: the base of
+	// the generated AGENTS.md, which holds real values.
+	agentsBase string
 
 	maskMap     masking.MaskMap
 	maskMapPath string
@@ -104,14 +107,15 @@ func withMaskingNote(systemPrompt string, noMask bool) string {
 func New(workDir, outputDir, agents string, p llm.Provider, noMask bool) *Orchestrator {
 	ctx, cancel := context.WithCancel(context.Background())
 	o := &Orchestrator{
-		client:    llm.NewClient(p, withMaskingNote(agents, noMask)),
-		provider:  p,
-		stMgr:     state.NewManager(workDir),
-		workDir:   workDir,
-		outputDir: outputDir,
-		noMask:    noMask,
-		ctx:       ctx,
-		cancel:    cancel,
+		client:     llm.NewClient(p, withMaskingNote(agents, noMask)),
+		provider:   p,
+		stMgr:      state.NewManager(workDir),
+		workDir:    workDir,
+		outputDir:  outputDir,
+		noMask:     noMask,
+		agentsBase: agents,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 	// Set even with noMask: the client refuses to send without a gate.
 	o.client.SetGate(o.outgoing)
@@ -661,8 +665,17 @@ func (o *Orchestrator) runValidation(sess *state.Session) error {
 		if err := o.stMgr.Advance(sess, state.PhaseDocument, state.Checkpoint{}); err != nil {
 			return err
 		}
-		dc := &docsClient{o: o, sess: sess}
-		docs.Generate(dc, sess, o.outputDir, func(msg string) { o.status("%s", msg) })
+		project, err := o.renderProject()
+		if err != nil {
+			return err
+		}
+		dc := &docsClient{o: o}
+		unmask := func(s string) string { return s }
+		if !o.noMask {
+			// Read the map at call time: the gate may extend it during the call.
+			unmask = func(s string) string { return masking.UnmaskText(s, o.maskMap) }
+		}
+		docs.Generate(o.ctx, dc, sess, o.outputDir, o.agentsBase, project, unmask, func(msg string) { o.status("%s", msg) })
 		// Docs are best-effort, but a security stop or an interrupt is not.
 		// An interrupt can surface as a provider or context error, so the
 		// flag is checked too; the session stays resumable at the docs phase.
@@ -697,22 +710,20 @@ func (o *Orchestrator) runValidation(sess *state.Session) error {
 	return nil
 }
 
-// docsClient adapts the orchestrator to docs.Client: queries go through the
-// gate with the session context, and answers come back with real values
-// because the docs package writes them to disk.
+// docsClient adapts the orchestrator's gated client to docs.Client and
+// records the first error, which docs.Generate only reports. The docs prompt
+// carries its own task header; answers are de-masked by docs, not here.
 type docsClient struct {
-	o    *Orchestrator
-	sess *state.Session
-	err  error // last query error, which docs.Generate only reports
+	o   *Orchestrator
+	err error
 }
 
-func (d *docsClient) Query(prompt string) (string, error) {
-	resp, err := d.o.ask(d.sess, taskDocs, prompt, true)
-	if err != nil {
+func (d *docsClient) Query(ctx context.Context, prompt string) (string, error) {
+	resp, err := d.o.client.Query(ctx, prompt)
+	if err != nil && d.err == nil {
 		d.err = err
-		return "", err
 	}
-	return masking.UnmaskText(resp, d.o.maskMap), nil
+	return resp, err
 }
 
 // maxStageOutput bounds raw validator output forwarded to auto-fix.

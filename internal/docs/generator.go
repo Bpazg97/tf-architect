@@ -1,6 +1,7 @@
 package docs
 
 import (
+	"context"
 	"time"
 
 	"tf-architect/internal/state"
@@ -10,7 +11,7 @@ import (
 // 1. Architectural docs (Claude) — writes prefix + docs/ directory
 // 2. terraform-docs — injects technical docs into BEGIN_TF_DOCS markers
 // Both passes are best-effort: the IaC is usable even if docs fail.
-func Generate(client Client, sess *state.Session, outputDir string, onStatus func(string)) {
+func Generate(ctx context.Context, client Client, sess *state.Session, outputDir, agentsBase, project string, unmask func(string) string, onStatus func(string)) {
 	onStatus("── Documentation ───────────────────────────")
 
 	sd := SessionData{
@@ -34,7 +35,7 @@ func Generate(client Client, sess *state.Session, outputDir string, onStatus fun
 	}
 
 	// Pass 1: architectural docs
-	if err := GenerateArchitecturalDocs(client, sd, outputDir, onStatus); err != nil {
+	if err := GenerateArchitecturalDocs(ctx, client, sd, outputDir, agentsBase, project, unmask, onStatus); err != nil {
 		onStatus("  ⚠ Architectural docs failed: " + err.Error())
 	}
 

@@ -43,7 +43,11 @@ Runbook
 ===END_RUNBOOK===
 ===BEGIN_VARIABLES===
 Variables
-===END_VARIABLES===`
+===END_VARIABLES===
+===BEGIN_PROJECT_AGENTS===
+### Layout
+VPC CIDR_PRIVATE_001
+===END_PROJECT_AGENTS===`
 
 func fileBlock(path, content string) string {
 	return "===FILE: " + path + "===\n" + content + "===END FILE===\n"
@@ -206,6 +210,9 @@ func TestRunNeverSendsSensitiveData(t *testing.T) {
 	}
 	if md := readFile(t, filepath.Join(outputDir, "docs", "ARCHITECTURE.md")); !strings.Contains(md, "10.20.0.0/16") {
 		t.Errorf("docs not de-masked:\n%s", md)
+	}
+	if ag := readFile(t, filepath.Join(outputDir, "AGENTS.md")); !strings.Contains(ag, "10.20.0.0/16") || strings.Contains(ag, "CIDR_PRIVATE_001") || !strings.Contains(ag, "## Project") {
+		t.Errorf("AGENTS.md missing or not de-masked:\n%s", ag)
 	}
 
 	// Doc-changed run sends the real files on disk: still nothing leaks.
