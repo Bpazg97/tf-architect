@@ -608,3 +608,94 @@ func TestReviewNoChanges(t *testing.T) {
 		t.Errorf("main.tf changed by a NO_CHANGES review:\n%s", got)
 	}
 }
+
+func TestDocChangedUsesAdjustThenReview(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	p := &fakeProvider{}
+	run := func() {
+		t.Helper()
+		if err := orchestrator.New(workDir, outputDir, "", p, false).Run(docPath); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	}
+	run()
+	p.reset()
+	if err := os.WriteFile(docPath, []byte("# LLD\n\nVPC 10.20.0.0/16\nNew cache tier.\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var adjustPrompt string
+	p.respond = func(system, prompt string) string {
+		if strings.Contains(prompt, "## TASK: ADJUST") {
+			adjustPrompt = prompt
+		}
+		return fakeModel(system, prompt)
+	}
+	run()
+	var got []string
+	for _, h := range p.headers() {
+		if h == "ADJUST" || h == "REVIEW" {
+			got = append(got, h)
+		}
+	}
+	if !equal(got, []string{"ADJUST", "REVIEW"}) {
+		t.Fatalf("headers = %v, want ADJUST then REVIEW", got)
+	}
+	if !strings.Contains(adjustPrompt, "DOCUMENT CHANGED") || !strings.Contains(adjustPrompt, "New cache tier") {
+		t.Errorf("ADJUST prompt lacks the diff summary:\n%s", adjustPrompt)
+	}
+	if !strings.Contains(adjustPrompt, "===FILE: main.tf===") || !strings.Contains(adjustPrompt, "CIDR_PRIVATE_001") || strings.Contains(adjustPrompt, "10.20.0.0/16") {
+		t.Errorf("ADJUST prompt lacks the masked rendered project:\n%s", adjustPrompt)
+	}
+}
+
+func TestAutoFixUsesFixWithProject(t *testing.T) {
+	installTerraform(t, false)
+	workDir, docPath, outputDir := setupDoc(t)
+	var fixPrompt string
+	p := &fakeProvider{respond: func(system, prompt string) string {
+		if strings.Contains(prompt, "## TASK: FIX") {
+			fixPrompt = prompt
+		}
+		return fakeModel(system, prompt)
+	}}
+	_ = orchestrator.New(workDir, outputDir, "", p, false).Run(docPath)
+	if !strings.Contains(fixPrompt, "Validation errors:") || !strings.Contains(fixPrompt, "bad") {
+		t.Errorf("FIX prompt lacks the errors:\n%s", fixPrompt)
+	}
+	if !strings.Contains(fixPrompt, "===FILE: main.tf===") || !strings.Contains(fixPrompt, "CIDR_PRIVATE_001") || strings.Contains(fixPrompt, "10.20.0.0/16") {
+		t.Errorf("FIX prompt lacks the masked project:\n%s", fixPrompt)
+	}
+	if tf := readFile(t, filepath.Join(outputDir, "main.tf")); !strings.Contains(tf, "# fixed") || !strings.Contains(tf, "10.20.0.0/16") {
+		t.Errorf("fix not applied de-masked:\n%s", tf)
+	}
+}
+
+func TestOverBudgetStops(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	run := func(p *fakeProvider) error {
+		return orchestrator.New(workDir, outputDir, "", p, false).Run(docPath)
+	}
+	if err := run(&fakeProvider{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(docPath, []byte("# LLD\n\nVPC 10.20.0.0/16\nMore.\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	big := "# " + strings.Repeat("x", 500_000) + "\n"
+	if err := os.WriteFile(filepath.Join(outputDir, "big.tf"), []byte(big), 0644); err != nil {
+		t.Fatal(err)
+	}
+	p := &fakeProvider{}
+	err := run(p)
+	var se *security.Error
+	if !errors.As(err, &se) {
+		t.Fatalf("expected *security.Error, got %v", err)
+	}
+	for _, h := range p.headers() {
+		if h == "ADJUST" || h == "FIX" {
+			t.Errorf("%s called despite the over-budget project", h)
+		}
+	}
+}

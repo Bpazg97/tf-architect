@@ -40,6 +40,10 @@ const (
 // Module checkpoints are the module names.
 const reviewStep = "review"
 
+// adjustStep is the generate checkpoint recorded once ADJUST is applied, so a
+// resumed run goes straight to the review.
+const adjustStep = "adjust"
+
 // Orchestrator runs the tf-architect FSM.
 //
 // Security invariant: when masking is enabled, nothing sensitive reaches the
@@ -508,19 +512,25 @@ func (o *Orchestrator) generate(sess *state.Session, isDocChange bool) error {
 	case step == reviewStep:
 		o.status("Project already generated and reviewed — skipping generation")
 	case isDocChange:
-		o.status("Adjusting Terraform IaC in %s...", o.outputDir)
-		project, err := o.renderProject()
-		if err != nil {
-			return err
+		if step != adjustStep {
+			o.status("Adjusting Terraform IaC in %s...", o.outputDir)
+			project, err := o.renderProject()
+			if err != nil {
+				return err
+			}
+			body := "Adjust the existing Terraform project to reflect the document changes (see DOCUMENT CHANGED).\n" +
+				"Return only the files that must change, in full. Do not touch unaffected resources.\n\n" +
+				"Current project files:\n" + project
+			if err := o.askFiles(sess, taskAdjust, body); err != nil {
+				_ = o.stMgr.Save(sess)
+				return fmt.Errorf("adjust (state saved): %w", err)
+			}
+			o.checkpoint(sess, adjustStep)
 		}
-		body := "Adjust the existing Terraform project to reflect the document changes (see DOCUMENT CHANGED).\n" +
-			"Return only the files that must change, in full. Do not touch unaffected resources.\n\n" +
-			"Current project files:\n" + project
-		if err := o.askFiles(sess, taskAdjust, body); err != nil {
+		if err := o.reviewProject(sess); err != nil {
 			_ = o.stMgr.Save(sess)
-			return fmt.Errorf("adjust (state saved): %w", err)
+			return fmt.Errorf("review (state saved): %w", err)
 		}
-		o.checkpoint(sess, reviewStep)
 	default:
 		if err := o.generateStepwise(sess); err != nil {
 			_ = o.stMgr.Save(sess)
@@ -591,6 +601,12 @@ func (o *Orchestrator) generateStepwise(sess *state.Session) error {
 		o.checkpoint(sess, m.Name)
 	}
 
+	return o.reviewProject(sess)
+}
+
+// reviewProject has the model review the whole project, applies its changes
+// and records the review checkpoint.
+func (o *Orchestrator) reviewProject(sess *state.Session) error {
 	o.status("Reviewing the whole project...")
 	project, err := o.renderProject()
 	if err != nil {
