@@ -68,8 +68,10 @@ type Session struct {
 	CurrentPhase   Phase      `json:"current_phase"`
 	LastCheckpoint Checkpoint `json:"last_checkpoint"`
 
-	DocMarkdown    string               `json:"doc_markdown"`
-	AnalysisJSON   string               `json:"analysis_json"`
+	DocMarkdown  string `json:"doc_markdown"`
+	AnalysisJSON string `json:"analysis_json"`
+	// GenerationPlan is the validated plan JSON; empty until PLAN succeeds.
+	GenerationPlan string               `json:"generation_plan,omitempty"`
 	Clarifications []ClarificationRound `json:"clarifications"`
 	GeneratedFiles []string             `json:"generated_files"`
 	ValidationRuns []ValidationRun      `json:"validation_runs"`

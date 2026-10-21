@@ -57,6 +57,12 @@ func fakeModel(system, prompt string) string {
 		return docSections
 	case strings.Contains(prompt, "## TASK: ANALYZE"), strings.Contains(prompt, "## TASK: CLARIFY"):
 		return `{"ready": true, "missing": [], "inconsistencies": [], "summary": "ok"}`
+	case strings.Contains(prompt, "## TASK: PLAN"):
+		return `{"modules": [{"name": "vpc", "files": ["modules/vpc/main.tf"]}]}`
+	case strings.Contains(prompt, "## TASK: MODULE vpc"):
+		return fileBlock("modules/vpc/main.tf", "# vpc\n")
+	case strings.Contains(prompt, "## TASK: REVIEW"):
+		return "NO_CHANGES"
 	case strings.Contains(prompt, "## TASK: MODULE root"):
 		return "Here are the files.\n" + fileBlock("main.tf", generatedTF)
 	case strings.Contains(prompt, "## TASK: FIX"):
@@ -459,5 +465,146 @@ func TestGateFailureDuringDocsStopsRun(t *testing.T) {
 	var se *security.Error
 	if !errors.As(err, &se) {
 		t.Fatalf("expected *security.Error, got %v", err)
+	}
+}
+
+// headers returns the task header of every call, e.g. "MODULE vpc".
+func (f *fakeProvider) headers() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, c := range f.calls {
+		line, _, _ := strings.Cut(c.prompt, "\n")
+		out = append(out, strings.TrimPrefix(line, "## TASK: "))
+	}
+	return out
+}
+
+const twoModulePlan = `{"modules": [{"name": "vpc", "files": ["modules/vpc/main.tf"]}, {"name": "rds", "files": ["modules/rds/main.tf"]}]}`
+
+func planModel(system, prompt string) string {
+	switch {
+	case strings.Contains(prompt, "## TASK: PLAN"):
+		return twoModulePlan
+	case strings.Contains(prompt, "## TASK: MODULE vpc"):
+		return fileBlock("modules/vpc/main.tf", "# vpc 10.20.0.0/16\n")
+	case strings.Contains(prompt, "## TASK: MODULE rds"):
+		return fileBlock("modules/rds/main.tf", "# rds\n")
+	}
+	return fakeModel(system, prompt)
+}
+
+func generateHeaders(p *fakeProvider) []string {
+	var out []string
+	for _, h := range p.headers() {
+		if h == "PLAN" || h == "REVIEW" || strings.HasPrefix(h, "MODULE ") {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+func equal(a, b []string) bool { return strings.Join(a, "|") == strings.Join(b, "|") }
+
+func TestGenerateCallsPerModuleThenReview(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	var rdsPrompt string
+	p := &fakeProvider{respond: func(system, prompt string) string {
+		if strings.Contains(prompt, "## TASK: MODULE rds") {
+			rdsPrompt = prompt
+		}
+		return planModel(system, prompt)
+	}}
+	if err := orchestrator.New(workDir, outputDir, "", p, false).Run(docPath); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := []string{"PLAN", "MODULE vpc", "MODULE rds", "MODULE root", "REVIEW"}
+	if got := generateHeaders(p); !equal(got, want) {
+		t.Errorf("headers = %v, want %v", got, want)
+	}
+	if !strings.Contains(rdsPrompt, "modules/vpc/main.tf") || strings.Contains(rdsPrompt, "10.20.0.0/16") || !strings.Contains(rdsPrompt, "CIDR_PRIVATE_001") {
+		t.Errorf("MODULE rds prompt must carry the masked files already written:\n%s", rdsPrompt)
+	}
+	sess, _ := state.NewManager(workDir).FindByDocPath(docPath)
+	if sess == nil || !strings.Contains(sess.GenerationPlan, `"rds"`) {
+		t.Errorf("plan not persisted: %+v", sess)
+	}
+}
+
+// resumeAt runs a session whose generate phase stopped after step.
+func resumeAt(t *testing.T, step string) *fakeProvider {
+	t.Helper()
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	hash, err := state.HashDoc(docPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr := state.NewManager(workDir)
+	sess := &state.Session{
+		DocPath: docPath, DocHash: hash, CurrentPhase: state.PhaseGenerate,
+		DocMarkdown: "# LLD", AnalysisJSON: `{"ready": true}`,
+		GenerationPlan: twoModulePlan,
+		LastCheckpoint: state.Checkpoint{Phase: state.PhaseGenerate, GenerateStep: step},
+	}
+	if err := mgr.Save(sess); err != nil {
+		t.Fatal(err)
+	}
+	p := &fakeProvider{respond: planModel}
+	if err := orchestrator.New(workDir, outputDir, "", p, false).Run(docPath); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return p
+}
+
+func TestResumeSkipsCompletedModules(t *testing.T) {
+	p := resumeAt(t, "rds")
+	if got, want := generateHeaders(p), []string{"MODULE root", "REVIEW"}; !equal(got, want) {
+		t.Errorf("headers = %v, want %v", got, want)
+	}
+}
+
+func TestResumeSkipsDoneReview(t *testing.T) {
+	p := resumeAt(t, "review")
+	if got := generateHeaders(p); len(got) != 0 {
+		t.Errorf("generation headers after a done review: %v", got)
+	}
+}
+
+func TestTruncatedTwiceStops(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	p := &fakeProvider{respond: func(system, prompt string) string {
+		if strings.Contains(prompt, "## TASK: MODULE vpc") {
+			return "===FILE: modules/vpc/main.tf===\nresource \"x\" \"y\" {\n"
+		}
+		return fakeModel(system, prompt)
+	}}
+	err := orchestrator.New(workDir, outputDir, "", p, false).Run(docPath)
+	var se *security.Error
+	if !errors.As(err, &se) {
+		t.Fatalf("expected *security.Error, got %v", err)
+	}
+	n := 0
+	for _, h := range p.headers() {
+		if h == "MODULE vpc" {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Errorf("MODULE vpc called %d times, want 2", n)
+	}
+}
+
+func TestReviewNoChanges(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	p := &fakeProvider{}
+	if err := orchestrator.New(workDir, outputDir, "", p, false).Run(docPath); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := readFile(t, filepath.Join(outputDir, "main.tf")); !strings.Contains(got, "10.20.0.0/16") || strings.Contains(got, "# fixed") {
+		t.Errorf("main.tf changed by a NO_CHANGES review:\n%s", got)
 	}
 }

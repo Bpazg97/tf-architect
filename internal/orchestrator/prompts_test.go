@@ -70,3 +70,31 @@ func TestBuildClarifyPrompt(t *testing.T) {
 		t.Error("clarify prompt should include the previous analysis")
 	}
 }
+
+func TestParseGenerationPlanAppendsRoot(t *testing.T) {
+	plan, err := orchestrator.ParseGenerationPlan("```json\n{\"modules\": [{\"name\": \"vpc\", \"files\": [\"modules/vpc/main.tf\"]}]}\n```")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Modules) != 2 || plan.Modules[1].Name != "root" || len(plan.Modules[1].Files) != 6 {
+		t.Errorf("root not appended: %+v", plan)
+	}
+}
+
+func TestParseGenerationPlanKeepsRootLast(t *testing.T) {
+	plan, err := orchestrator.ParseGenerationPlan(`{"modules": [{"name": "root", "files": ["main.tf"]}, {"name": "vpc", "files": []}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Modules) != 2 || plan.Modules[0].Name != "vpc" || plan.Modules[1].Name != "root" || len(plan.Modules[1].Files) != 1 {
+		t.Errorf("root not kept last with its files: %+v", plan)
+	}
+}
+
+func TestParseGenerationPlanRejects(t *testing.T) {
+	for _, raw := range []string{`{"modules": []}`, `{"modules": [{"name": " ", "files": []}]}`, `nope`} {
+		if _, err := orchestrator.ParseGenerationPlan(raw); err == nil {
+			t.Errorf("expected error for %q", raw)
+		}
+	}
+}

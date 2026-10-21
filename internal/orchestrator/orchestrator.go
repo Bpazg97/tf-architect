@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -27,14 +28,17 @@ const maxClarifyRounds = 3
 const (
 	taskAnalyze = "## TASK: ANALYZE"
 	taskClarify = "## TASK: CLARIFY"
-	taskRoot    = "## TASK: MODULE root"
+	taskPlan    = "## TASK: PLAN"
+	taskModule  = "## TASK: MODULE "
+	taskReview  = "## TASK: REVIEW"
 	taskAdjust  = "## TASK: ADJUST"
 	taskFix     = "## TASK: FIX"
 	taskDocs    = "## TASK: DOCS"
 )
 
-// rootStep is the generate checkpoint recorded once the project is written.
-const rootStep = "root"
+// reviewStep is the generate checkpoint recorded once the review is applied.
+// Module checkpoints are the module names.
+const reviewStep = "review"
 
 // Orchestrator runs the tf-architect FSM.
 //
@@ -248,16 +252,40 @@ func (o *Orchestrator) ask(sess *state.Session, header, body string, withContext
 	return o.client.Query(o.ctx, sb.String())
 }
 
-// askFiles sends a task whose answer is files in the protocol, and writes them.
+// completeFiles sends a task whose answer is files in the protocol and
+// returns them. A truncated answer is retried once; a second truncation
+// stops the run.
+func (o *Orchestrator) completeFiles(sess *state.Session, header, body string) ([]fileproto.Change, error) {
+	for attempt := 0; ; attempt++ {
+		resp, err := o.ask(sess, header, body, true)
+		if err != nil {
+			return nil, err
+		}
+		changes, warnings, err := fileproto.Parse(resp)
+		if errors.Is(err, fileproto.ErrTruncated) {
+			if attempt == 0 {
+				o.status("Warning: the AI response was cut off — retrying once")
+				continue
+			}
+			return nil, security.New(
+				"the AI response was cut off twice",
+				"The model hit its output limit, so its files are incomplete and were not written.",
+				"Use a model with a larger output limit or simplify the document.",
+			)
+		}
+		for _, w := range warnings {
+			o.status("Warning: %s", w)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return changes, nil
+	}
+}
+
+// askFiles runs completeFiles and writes the result.
 func (o *Orchestrator) askFiles(sess *state.Session, header, body string) error {
-	resp, err := o.ask(sess, header, body, true)
-	if err != nil {
-		return err
-	}
-	changes, warnings, err := fileproto.Parse(resp)
-	for _, w := range warnings {
-		o.status("Warning: %s", w)
-	}
+	changes, err := o.completeFiles(sess, header, body)
 	if err != nil {
 		return err
 	}
@@ -475,9 +503,10 @@ func (o *Orchestrator) clarify(sess *state.Session) error {
 }
 
 func (o *Orchestrator) generate(sess *state.Session, isDocChange bool) error {
+	step := sess.LastCheckpoint.GenerateStep
 	switch {
-	case sess.LastCheckpoint.GenerateStep == rootStep:
-		o.status("Project already generated — skipping generation")
+	case step == reviewStep:
+		o.status("Project already generated and reviewed — skipping generation")
 	case isDocChange:
 		o.status("Adjusting Terraform IaC in %s...", o.outputDir)
 		project, err := o.renderProject()
@@ -491,24 +520,92 @@ func (o *Orchestrator) generate(sess *state.Session, isDocChange bool) error {
 			_ = o.stMgr.Save(sess)
 			return fmt.Errorf("adjust (state saved): %w", err)
 		}
+		o.checkpoint(sess, reviewStep)
 	default:
-		o.status("Generating Terraform IaC in %s...", o.outputDir)
-		body := "Generate the complete, production-grade Terraform project for the analyzed architecture: " +
-			"every module and the root files (versions.tf, providers.tf, main.tf, variables.tf, outputs.tf, ...).\n" +
-			"Return every file in the output protocol, with paths relative to the project root.\n\n" +
-			"Architecture document:\n---\n" + sess.DocMarkdown
-		if err := o.askFiles(sess, taskRoot, body); err != nil {
+		if err := o.generateStepwise(sess); err != nil {
 			_ = o.stMgr.Save(sess)
 			return fmt.Errorf("generate (state saved): %w", err)
 		}
 	}
-	sess.LastCheckpoint = state.Checkpoint{Phase: state.PhaseGenerate, GenerateStep: rootStep, CompletedAt: time.Now()}
-	_ = o.stMgr.Save(sess)
 
 	sess.GeneratedFiles = collectTFFiles(o.outputDir)
 	if len(sess.GeneratedFiles) == 0 {
 		o.status("Warning: no .tf files found in %s — generation may have failed silently", o.outputDir)
 	}
+	return nil
+}
+
+func (o *Orchestrator) checkpoint(sess *state.Session, step string) {
+	sess.LastCheckpoint = state.Checkpoint{Phase: state.PhaseGenerate, GenerateStep: step, CompletedAt: time.Now()}
+	_ = o.stMgr.Save(sess)
+}
+
+// generateStepwise plans the modules, generates one per call (root last) and
+// reviews the whole project, checkpointing after each module and the review.
+func (o *Orchestrator) generateStepwise(sess *state.Session) error {
+	done := sess.LastCheckpoint.GenerateStep
+	var plan GenerationPlan
+	if sess.GenerationPlan != "" {
+		p, err := ParseGenerationPlan(sess.GenerationPlan)
+		if err != nil {
+			return err
+		}
+		plan = p
+	} else {
+		// No plan (new run, or a legacy checkpoint): plan and start over.
+		done = ""
+		o.status("Planning modules...")
+		raw, err := o.ask(sess, taskPlan, BuildPlanPrompt(sess.DocMarkdown), true)
+		if err != nil {
+			return err
+		}
+		if plan, err = ParseGenerationPlan(raw); err != nil {
+			return err
+		}
+		valid, err := json.Marshal(plan)
+		if err != nil {
+			return err
+		}
+		sess.GenerationPlan = string(valid)
+		if err := o.stMgr.Save(sess); err != nil {
+			return err
+		}
+	}
+
+	start := 0
+	for i, m := range plan.Modules {
+		if m.Name == done {
+			start = i + 1
+		}
+	}
+	for _, m := range plan.Modules[start:] {
+		o.status("Generating module %s...", m.Name)
+		project, err := o.renderProject()
+		if err != nil {
+			return err
+		}
+		body := BuildModulePrompt(plan, m, project, sess.DocMarkdown)
+		if err := o.askFiles(sess, taskModule+m.Name, body); err != nil {
+			return fmt.Errorf("module %s: %w", m.Name, err)
+		}
+		o.checkpoint(sess, m.Name)
+	}
+
+	o.status("Reviewing the whole project...")
+	project, err := o.renderProject()
+	if err != nil {
+		return err
+	}
+	changes, err := o.completeFiles(sess, taskReview, BuildReviewPrompt(project))
+	if err != nil {
+		return fmt.Errorf("review: %w", err)
+	}
+	if len(changes) == 0 {
+		o.status("Review found nothing to change")
+	} else if err := o.applyChanges(changes); err != nil {
+		return fmt.Errorf("review: %w", err)
+	}
+	o.checkpoint(sess, reviewStep)
 	return nil
 }
 
