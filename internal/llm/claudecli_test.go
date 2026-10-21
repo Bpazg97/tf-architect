@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,9 +17,11 @@ import (
 
 // helperRecord is what the stub claude writes about how it was started.
 type helperRecord struct {
-	Args []string `json:"args"`
-	Env  []string `json:"env"`
-	Cwd  string   `json:"cwd"`
+	Args   []string `json:"args"`
+	Env    []string `json:"env"`
+	Cwd    string   `json:"cwd"`
+	Stdin  string   `json:"stdin"`
+	System string   `json:"system"` // content of --system-prompt-file
 }
 
 // TestHelperClaude is not a real test: it is the stub claude binary. It runs
@@ -35,7 +38,12 @@ func TestHelperClaude(t *testing.T) {
 		}
 	}
 	cwd, _ := os.Getwd()
-	rec, _ := json.Marshal(helperRecord{Args: args, Env: os.Environ(), Cwd: cwd})
+	stdin, _ := io.ReadAll(os.Stdin)
+	var system []byte
+	if i := slices.Index(args, "--system-prompt-file"); i >= 0 && i+1 < len(args) {
+		system, _ = os.ReadFile(args[i+1])
+	}
+	rec, _ := json.Marshal(helperRecord{Args: args, Env: os.Environ(), Cwd: cwd, Stdin: string(stdin), System: string(system)})
 	_ = os.WriteFile(os.Getenv("HELPER_OUT"), rec, 0o600)
 
 	if root := os.Getenv("HELPER_TRANSCRIPT_ROOT"); root != "" {
@@ -106,14 +114,27 @@ func TestClaudeArgsAndEnv(t *testing.T) {
 	}
 	rec := readRecord(t, out)
 
+	if len(rec.Args) < 3 {
+		t.Fatalf("args too short: %q", rec.Args)
+	}
+	sysFile := rec.Args[len(rec.Args)-3]
 	want := []string{
 		"-p", "--output-format", "stream-json", "--verbose", "--safe-mode",
 		"--no-session-persistence", "--restricted", "--strict-mcp-config",
 		"--setting-sources", "", "--tools", "", "--permission-prompts", "none",
-		"--system-prompt", "SYS", "--model", "claude-test-model", "PROMPT",
+		"--system-prompt-file", sysFile, "--model", "claude-test-model",
 	}
 	if !slices.Equal(rec.Args, want) {
 		t.Errorf("args:\n got %q\nwant %q", rec.Args, want)
+	}
+	if rec.Stdin != "PROMPT" || rec.System != "SYS" {
+		t.Errorf("stdin=%q system file=%q", rec.Stdin, rec.System)
+	}
+	if !filepath.IsAbs(sysFile) || strings.HasPrefix(sysFile, rec.Cwd+string(filepath.Separator)) {
+		t.Errorf("system prompt file %q must be absolute and outside the CLI cwd %q", sysFile, rec.Cwd)
+	}
+	if _, err := os.Stat(sysFile); !os.IsNotExist(err) {
+		t.Errorf("system prompt file %s not removed after Complete", sysFile)
 	}
 	for _, kv := range []string{"CLAUDE_CODE_DISABLE_CLAUDE_MDS=1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"} {
 		if !slices.Contains(rec.Env, kv) {
@@ -140,7 +161,7 @@ func TestClaudeArgsWithoutModel(t *testing.T) {
 }
 
 func TestCheckInit(t *testing.T) {
-	cwd := t.TempDir()
+	cwd, otherDir := t.TempDir(), t.TempDir()
 	clean := func() map[string]any {
 		return map[string]any{
 			"type": "system", "subtype": "init", "cwd": cwd,
@@ -167,6 +188,7 @@ func TestCheckInit(t *testing.T) {
 			ev["plugins"] = []any{map[string]any{"name": "x", "path": "/home/u/.claude/plugins/x"}}
 		},
 		"cwd mismatch":    func(ev map[string]any) { ev["cwd"] = "/somewhere/else" },
+		"other real dir":  func(ev map[string]any) { ev["cwd"] = otherDir },
 		"old version":     func(ev map[string]any) { ev["claude_code_version"] = "2.1.100" },
 		"missing version": func(ev map[string]any) { delete(ev, "claude_code_version") },
 		"missing tools":   func(ev map[string]any) { delete(ev, "tools") },
@@ -248,13 +270,38 @@ func TestPreflight(t *testing.T) {
 	if err := c.Preflight(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if args := readRecord(t, out).Args; args[len(args)-1] != "Reply with OK." {
-		t.Errorf("preflight prompt = %q", args[len(args)-1])
+	if got := readRecord(t, out).Stdin; got != "Reply with OK." {
+		t.Errorf("preflight prompt = %q", got)
 	}
 
 	bad, _ := stubCLI(t, "bad-plugin")
 	var se *security.Error
 	if err := bad.Preflight(context.Background()); !errors.As(err, &se) {
 		t.Errorf("want *security.Error, got %v", err)
+	}
+}
+
+func TestLargePromptViaStdin(t *testing.T) {
+	c, out := stubCLI(t, "clean")
+	prompt := strings.Repeat("x", 300*1024)
+	if _, err := c.Complete(context.Background(), "SYS", prompt); err != nil {
+		t.Fatal(err)
+	}
+	if got := readRecord(t, out).Stdin; got != prompt {
+		t.Errorf("stdin got %d bytes, want %d", len(got), len(prompt))
+	}
+}
+
+func TestPromptIsNotAnOption(t *testing.T) {
+	c, out := stubCLI(t, "clean")
+	if _, err := c.Complete(context.Background(), "SYS", "--tools=Bash"); err != nil {
+		t.Fatal(err)
+	}
+	rec := readRecord(t, out)
+	if rec.Stdin != "--tools=Bash" {
+		t.Errorf("stdin = %q", rec.Stdin)
+	}
+	if slices.Contains(rec.Args, "--tools=Bash") {
+		t.Errorf("prompt reached argv: %q", rec.Args)
 	}
 }

@@ -66,10 +66,10 @@ func TestClientGateApplied(t *testing.T) {
 
 func TestClientWithoutGate(t *testing.T) {
 	spy := &spyProvider{}
-	if _, err := NewClient(spy, "s").Query(context.Background(), "p"); err != nil {
-		t.Fatal(err)
+	if _, err := NewClient(spy, "s").Query(context.Background(), "p"); err == nil {
+		t.Fatal("expected error without a gate")
 	}
-	if spy.system != "s" || spy.prompt != "p" {
-		t.Errorf("provider saw system=%q prompt=%q", spy.system, spy.prompt)
+	if spy.calls != 0 {
+		t.Error("provider called without a gate")
 	}
 }

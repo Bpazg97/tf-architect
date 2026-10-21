@@ -50,11 +50,26 @@ func (c *ClaudeCLI) Complete(ctx context.Context, system, prompt string) (string
 	defer os.RemoveAll(cwd)
 	defer c.removeTranscript(cwd)
 
+	// The system prompt goes through a file and the prompt through stdin:
+	// argv is size-limited (128 KiB per argument on Linux), visible in ps,
+	// and a prompt starting with "-" would be parsed as an option. The file
+	// lives outside the CLI's cwd so the model's directory stays empty.
+	sysDir, err := os.MkdirTemp("", "tfa-claude-sys-")
+	if err != nil {
+		return "", fmt.Errorf("creating system prompt dir: %w", err)
+	}
+	defer os.RemoveAll(sysDir)
+	sysFile := filepath.Join(sysDir, "system.txt")
+	if err := os.WriteFile(sysFile, []byte(system), 0o600); err != nil {
+		return "", fmt.Errorf("writing system prompt: %w", err)
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, c.bin(), c.buildArgs(system, prompt)...)
+	cmd := exec.CommandContext(ctx, c.bin(), c.buildArgs(sysFile)...)
 	cmd.Dir = cwd
+	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Env = append(os.Environ(),
 		"CLAUDE_CODE_DISABLE_CLAUDE_MDS=1",
 		"CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
@@ -124,7 +139,7 @@ func (c *ClaudeCLI) removeTranscript(cwd string) {
 	}
 }
 
-func (c *ClaudeCLI) buildArgs(system, prompt string) []string {
+func (c *ClaudeCLI) buildArgs(systemFile string) []string {
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -136,12 +151,12 @@ func (c *ClaudeCLI) buildArgs(system, prompt string) []string {
 		"--setting-sources", "",
 		"--tools", "",
 		"--permission-prompts", "none",
-		"--system-prompt", system,
+		"--system-prompt-file", systemFile,
 	}
 	if c.Model != "" {
 		args = append(args, "--model", c.Model)
 	}
-	return append(args, prompt)
+	return args
 }
 
 // streamState is what readEvents learned from one CLI run.

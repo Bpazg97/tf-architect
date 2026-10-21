@@ -5,6 +5,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -39,16 +40,18 @@ func (c *Client) SetGate(fn func(string) (string, error)) {
 }
 
 // Query gates the system prompt and prompt, then sends them to the provider.
+// Without a gate it refuses to send anything.
 func (c *Client) Query(ctx context.Context, prompt string) (string, error) {
-	system := c.system
-	if c.gate != nil {
-		var err error
-		if system, err = c.gate(system); err != nil {
-			return "", fmt.Errorf("gating system prompt (nothing sent): %w", err)
-		}
-		if prompt, err = c.gate(prompt); err != nil {
-			return "", fmt.Errorf("gating prompt (nothing sent): %w", err)
-		}
+	// Fail closed: without a gate nothing guarantees the text is masked.
+	if c.gate == nil {
+		return "", errors.New("no security gate set (nothing sent)")
+	}
+	system, err := c.gate(c.system)
+	if err != nil {
+		return "", fmt.Errorf("gating system prompt (nothing sent): %w", err)
+	}
+	if prompt, err = c.gate(prompt); err != nil {
+		return "", fmt.Errorf("gating prompt (nothing sent): %w", err)
 	}
 	return c.provider.Complete(ctx, system, prompt)
 }
