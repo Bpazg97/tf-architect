@@ -270,9 +270,17 @@ func (o *Orchestrator) askFiles(sess *state.Session, header, body string) error 
 // applyChanges writes the model's files to outputDir with real values,
 // warning about placeholders the mask map cannot resolve.
 func (o *Orchestrator) applyChanges(changes []fileproto.Change) error {
+	// Paths were masked in the rendered project too; Apply validates the
+	// de-masked ones.
+	unmasked := make([]fileproto.Change, len(changes))
+	for i, c := range changes {
+		c.Path = masking.UnmaskText(c.Path, o.maskMap)
+		unmasked[i] = c
+	}
+	changes = unmasked
 	if !o.noMask {
 		for _, c := range changes {
-			if u := masking.UnresolvedPlaceholders(c.Content, o.maskMap); len(u) > 0 {
+			if u := masking.UnresolvedPlaceholders(c.Path+"\n"+c.Content, o.maskMap); len(u) > 0 {
 				o.status("Warning: %s contains unknown placeholders, written as-is: %s", c.Path, strings.Join(u, ", "))
 			}
 		}
@@ -543,9 +551,15 @@ func (o *Orchestrator) runValidation(sess *state.Session) error {
 		dc := &docsClient{o: o, sess: sess}
 		docs.Generate(dc, sess, o.outputDir, func(msg string) { o.status("%s", msg) })
 		// Docs are best-effort, but a security stop or an interrupt is not.
+		// An interrupt can surface as a provider or context error, so the
+		// flag is checked too; the session stays resumable at the docs phase.
 		var se *security.Error
-		if errors.As(dc.err, &se) || errors.Is(dc.err, errInterrupted) {
+		if errors.As(dc.err, &se) {
 			return dc.err
+		}
+		if o.interrupted.Load() || errors.Is(dc.err, context.Canceled) {
+			_ = o.stMgr.Save(sess)
+			return fmt.Errorf("documentation (state saved): %w", errInterrupted)
 		}
 		if err := o.stMgr.Advance(sess, state.PhaseDone, state.Checkpoint{}); err != nil {
 			return err

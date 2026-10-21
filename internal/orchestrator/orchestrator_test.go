@@ -352,8 +352,112 @@ func TestNoMaskStillSends(t *testing.T) {
 	installTerraform(t, true)
 	workDir, docPath, outputDir := setupDoc(t)
 	p := &fakeProvider{}
-	_ = orchestrator.New(workDir, outputDir, "", p, true).Run(docPath)
+	if err := orchestrator.New(workDir, outputDir, "", p, true).Run(docPath); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
 	if len(p.calls) == 0 {
 		t.Error("noMask run must still query the provider through the gate")
+	}
+}
+
+func isDocsPrompt(prompt string) bool {
+	return strings.Contains(prompt, "===BEGIN_ROOT_README===")
+}
+
+func TestInterruptDuringDocsKeepsSessionResumable(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	var orch *orchestrator.Orchestrator
+	p := &fakeProvider{respond: func(system, prompt string) string {
+		if isDocsPrompt(prompt) {
+			// The in-flight request dies with a provider error, as a killed
+			// subprocess would.
+			orch.Interrupt()
+			return ""
+		}
+		return fakeModel(system, prompt)
+	}}
+	orch = orchestrator.New(workDir, outputDir, "", p, false)
+	if err := orch.Run(docPath); err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("expected interrupt error, got %v", err)
+	}
+	sess, _ := state.NewManager(workDir).FindByDocPath(docPath)
+	if sess == nil || sess.CurrentPhase == state.PhaseDone {
+		t.Errorf("session must not be done after an interrupted docs phase, got %+v", sess)
+	}
+}
+
+func TestMaskedPathIsWrittenWithRealValue(t *testing.T) {
+	installTerraform(t, false) // forces a FIX call with the rendered project
+	workDir, docPath, outputDir := setupDoc(t)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, "phoenix-net.tf"), []byte("# net\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var fixPrompt string
+	p := &fakeProvider{respond: func(system, prompt string) string {
+		if strings.Contains(prompt, "## TASK: FIX") {
+			fixPrompt = prompt
+			// Echo the path exactly as the model saw it.
+			for _, line := range strings.Split(prompt, "\n") {
+				if strings.HasPrefix(line, "===FILE: ") && strings.HasSuffix(line, "-net.tf===") {
+					path := strings.TrimSuffix(strings.TrimPrefix(line, "===FILE: "), "===")
+					return fileBlock(path, "# fixed\n")
+				}
+			}
+		}
+		return fakeModel(system, prompt)
+	}}
+	orch := orchestrator.New(workDir, outputDir, "", p, false)
+	orch.CustomSensitive = []string{"Phoenix"}
+	_ = orch.Run(docPath)
+	if fixPrompt == "" || strings.Contains(strings.ToLower(fixPrompt), "phoenix") {
+		t.Fatalf("FIX prompt missing or path not masked:\n%.300s", fixPrompt)
+	}
+	if got := readFile(t, filepath.Join(outputDir, "phoenix-net.tf")); got != "# fixed\n" {
+		t.Errorf("fix not written to the real path, got %q", got)
+	}
+	entries, _ := os.ReadDir(outputDir)
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "CUSTOM_") {
+			t.Errorf("file written under a placeholder path: %s", e.Name())
+		}
+	}
+}
+
+func TestGateFailureDuringDocsStopsRun(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	hash, err := state.HashDoc(docPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maskPath := state.NewManager(workDir).MaskMapPath(hash)
+	p := &fakeProvider{respond: func(system, prompt string) string {
+		if strings.Contains(prompt, "## TASK: MODULE root") {
+			// A new case variant of the custom value reaches the docs prompt
+			// through the file list, so the gate must save the mask map;
+			// a directory in its place makes that fail.
+			if err := os.Remove(maskPath); err != nil {
+				t.Error(err)
+			}
+			if err := os.Mkdir(maskPath, 0700); err != nil {
+				t.Error(err)
+			}
+			return fileBlock("main.tf", generatedTF) + fileBlock("phoenix-db.tf", "# db\n")
+		}
+		if isDocsPrompt(prompt) {
+			t.Error("docs prompt sent despite a failed gate")
+		}
+		return fakeModel(system, prompt)
+	}}
+	orch := orchestrator.New(workDir, outputDir, "", p, false)
+	orch.CustomSensitive = []string{"Phoenix"}
+	err = orch.Run(docPath)
+	var se *security.Error
+	if !errors.As(err, &se) {
+		t.Fatalf("expected *security.Error, got %v", err)
 	}
 }
