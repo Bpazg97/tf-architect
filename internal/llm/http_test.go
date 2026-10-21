@@ -230,3 +230,21 @@ func TestErrorBodyTruncated(t *testing.T) {
 		t.Fatalf("err len=%d", len(err.Error()))
 	}
 }
+
+func TestRedirectNotFollowed(t *testing.T) {
+	for _, name := range []string{"anthropic", "gemini", "openai"} {
+		t.Run(name, func(t *testing.T) {
+			var hitsB atomic.Int32
+			b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hitsB.Add(1) }))
+			defer b.Close()
+			a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, b.URL+"/x", http.StatusTemporaryRedirect)
+			}))
+			defer a.Close()
+			_, err := newTest(t, name, "m", a.URL).Complete(context.Background(), "s", "p")
+			if err == nil || hitsB.Load() != 0 || !strings.Contains(err.Error(), "307") {
+				t.Fatalf("err=%v hitsB=%d", err, hitsB.Load())
+			}
+		})
+	}
+}

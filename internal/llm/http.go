@@ -18,7 +18,13 @@ var retryDelays = []time.Duration{time.Second, 2 * time.Second}
 
 const maxErrBody = 500
 
-var httpClient = &http.Client{Timeout: 10 * time.Minute}
+// Redirects are never followed: Go would re-send custom key headers and the
+// POST body (the prompt) to the target, bypassing the HTTPS/local-only rule.
+// A 3xx surfaces as a non-2xx error.
+var httpClient = &http.Client{
+	Timeout:       10 * time.Minute,
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
 
 // postJSON POSTs body as JSON and decodes the 2xx response into out. Only 429
 // and 5xx are retried. Header values are treated as secrets and scrubbed from
