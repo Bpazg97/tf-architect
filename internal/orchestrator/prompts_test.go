@@ -58,12 +58,15 @@ func TestBuildQuestions(t *testing.T) {
 func TestBuildClarifyPrompt(t *testing.T) {
 	questions := []string{"What AWS region?", "What instance type?"}
 	answers := []string{"eu-west-1", "t3.medium"}
-	prompt := orchestrator.BuildClarifyPrompt(questions, answers)
+	prompt := orchestrator.BuildClarifyPrompt(`{"ready": false, "summary": "EKS cluster"}`, questions, answers)
 
 	if !strings.Contains(prompt, "eu-west-1") {
 		t.Error("clarify prompt should contain answers")
 	}
 	if !strings.Contains(prompt, "JSON") {
 		t.Error("clarify prompt should request JSON")
+	}
+	if !strings.Contains(prompt, "EKS cluster") {
+		t.Error("clarify prompt should include the previous analysis")
 	}
 }

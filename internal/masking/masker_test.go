@@ -69,8 +69,7 @@ owner = "acme-corp"`
 	}
 }
 
-func TestUnmask(t *testing.T) {
-	dir := t.TempDir()
+func TestUnmaskText(t *testing.T) {
 	content := `resource "aws_instance" "web" {
   tags = {
     Owner = "TAG_VALUE_001"
@@ -78,37 +77,17 @@ func TestUnmask(t *testing.T) {
   }
   private_ip = "IP_PRIVATE_001"
 }`
-	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(content), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("IP_PRIVATE_001"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
 	mm := masking.MaskMap{
 		"TAG_VALUE_001":  "tmobilitat",
 		"TAG_VALUE_002":  "production",
 		"IP_PRIVATE_001": "10.0.1.5",
 	}
-	if err := masking.Unmask(dir, mm); err != nil {
-		t.Fatalf("Unmask() error: %v", err)
+	got := masking.UnmaskText(content, mm)
+	if !strings.Contains(got, "tmobilitat") || !strings.Contains(got, "10.0.1.5") {
+		t.Errorf("values not restored:\n%s", got)
 	}
-
-	got, _ := os.ReadFile(filepath.Join(dir, "main.tf"))
-	if !strings.Contains(string(got), "tmobilitat") {
-		t.Error("tmobilitat not restored in .tf file")
-	}
-	if !strings.Contains(string(got), "10.0.1.5") {
-		t.Error("10.0.1.5 not restored in .tf file")
-	}
-	if strings.Contains(string(got), "TAG_VALUE_001") {
+	if strings.Contains(got, "TAG_VALUE_001") {
 		t.Error("placeholder still present after unmask")
-	}
-
-	// MaskDir masks every text file, so Unmask must restore every text file.
-	notf, _ := os.ReadFile(filepath.Join(dir, "notes.txt"))
-	if string(notf) != "10.0.1.5" {
-		t.Errorf("placeholder not restored in .txt: %s", notf)
 	}
 }
 
@@ -237,133 +216,49 @@ func TestMaskJsonPersist(t *testing.T) {
 	}
 }
 
-func TestMaskDirRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	tfContent := `private_ip = "10.0.1.5"
-owner_tag  = "tmobilitat"`
-	tfvarsContent := `account_id = "123456789012"`
-	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(tfContent), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "terraform.tfvars"), []byte(tfvarsContent), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("10.0.1.5"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	mm := masking.MaskMap{
-		"IP_PRIVATE_001": "10.0.1.5",
-		"TAG_VALUE_001":  "tmobilitat",
-		"ACCOUNT_001":    "123456789012",
-	}
-
-	mm, err := masking.MaskDir(dir, mm)
+func TestMaskUnmaskTextRoundTrip(t *testing.T) {
+	content := "private_ip = \"10.0.1.5\"\naccount_id = \"123456789012\"\npolicy = \"arn:aws:s3:::acme-secret-bucket\"\n"
+	masked, mm, err := masking.Mask(content, nil)
 	if err != nil {
-		t.Fatalf("MaskDir() error: %v", err)
+		t.Fatal(err)
 	}
-	tf, _ := os.ReadFile(filepath.Join(dir, "main.tf"))
-	if strings.Contains(string(tf), "10.0.1.5") || strings.Contains(string(tf), "tmobilitat") {
-		t.Errorf("real values still present in .tf after MaskDir:\n%s", tf)
+	for _, real := range []string{"10.0.1.5", "123456789012", "acme-secret-bucket"} {
+		if strings.Contains(masked, real) {
+			t.Errorf("%q still present after Mask:\n%s", real, masked)
+		}
 	}
-	tfvars, _ := os.ReadFile(filepath.Join(dir, "terraform.tfvars"))
-	if strings.Contains(string(tfvars), "123456789012") {
-		t.Errorf("account ID still present in .tfvars after MaskDir:\n%s", tfvars)
-	}
-	// Claude can read every file in the dir, so every text file is masked.
-	txt, _ := os.ReadFile(filepath.Join(dir, "notes.txt"))
-	if strings.Contains(string(txt), "10.0.1.5") {
-		t.Error("real value still present in .txt after MaskDir")
-	}
-
-	if err := masking.Unmask(dir, mm); err != nil {
-		t.Fatalf("Unmask() error: %v", err)
-	}
-	tf2, _ := os.ReadFile(filepath.Join(dir, "main.tf"))
-	if string(tf2) != tfContent {
-		t.Errorf("round-trip mismatch:\nwant: %s\ngot:  %s", tfContent, tf2)
+	if got := masking.UnmaskText(masked, mm); got != content {
+		t.Errorf("round-trip mismatch:\nwant: %s\ngot:  %s", content, got)
 	}
 }
 
-func TestUnmaskTfvarsAndMd(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "vars.tfvars"), []byte(`ip = "IP_PRIVATE_001"`), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "docs", "ARCHITECTURE.md"), []byte("CIDR: CIDR_PRIVATE_001"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	mm := masking.MaskMap{
-		"IP_PRIVATE_001":   "10.0.1.5",
-		"CIDR_PRIVATE_001": "10.0.0.0/16",
-	}
-	if err := masking.Unmask(dir, mm); err != nil {
-		t.Fatalf("Unmask() error: %v", err)
-	}
-
-	tfvars, _ := os.ReadFile(filepath.Join(dir, "vars.tfvars"))
-	if !strings.Contains(string(tfvars), "10.0.1.5") {
-		t.Error("placeholder not restored in .tfvars")
-	}
-	md, _ := os.ReadFile(filepath.Join(dir, "docs", "ARCHITECTURE.md"))
-	if !strings.Contains(string(md), "10.0.0.0/16") {
-		t.Error("placeholder not restored in nested .md")
-	}
-}
-
-func TestUnmaskPlaceholderPrefixCollision(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "main.tf"),
-		[]byte("a = \"ACCOUNT_100\"\nb = \"ACCOUNT_1000\""), 0644); err != nil {
-		t.Fatal(err)
-	}
+func TestUnmaskTextPlaceholderPrefixCollision(t *testing.T) {
 	mm := masking.MaskMap{
 		"ACCOUNT_100":  "111111111111",
 		"ACCOUNT_1000": "222222222222",
 	}
-	if err := masking.Unmask(dir, mm); err != nil {
-		t.Fatalf("Unmask() error: %v", err)
-	}
-	got, _ := os.ReadFile(filepath.Join(dir, "main.tf"))
+	got := masking.UnmaskText("a = \"ACCOUNT_100\"\nb = \"ACCOUNT_1000\"", mm)
 	want := "a = \"111111111111\"\nb = \"222222222222\""
-	if string(got) != want {
+	if got != want {
 		t.Errorf("prefix collision corrupted output:\nwant: %s\ngot:  %s", want, got)
 	}
 }
 
-func TestMaskDirMasksUnknownValuesAndSkipsTerraformCache(t *testing.T) {
-	dir := t.TempDir()
-	policy := `{"Resource": "arn:aws:s3:::acme-secret-bucket"}`
-	if err := os.WriteFile(filepath.Join(dir, "policy.json"), []byte(policy), 0644); err != nil {
-		t.Fatal(err)
+func TestUnresolvedPlaceholders(t *testing.T) {
+	mm := masking.MaskMap{
+		"CIDR_PRIVATE_001":     "10.0.0.0/16",
+		"ACCOUNT_100":          "111111111111",
+		"arn:aws:RESOURCE_001": "arn:aws:iam::111111111111:role/x",
 	}
-	cache := filepath.Join(dir, ".terraform", "modules")
-	if err := os.MkdirAll(cache, 0755); err != nil {
-		t.Fatal(err)
+	text := "a = \"CIDR_PRIVATE_001\"\nb = \"CIDR_PRIVATE_999\"\nc = \"ACCOUNT_1000\"\n" +
+		"d = \"arn:aws:RESOURCE_001\"\ne = \"CIDR_PRIVATE_999\"\n"
+	got := masking.UnresolvedPlaceholders(text, mm)
+	want := []string{"CIDR_PRIVATE_999", "ACCOUNT_1000"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("UnresolvedPlaceholders = %v, want %v", got, want)
 	}
-	cached := `cidr = "10.9.9.0/24"`
-	if err := os.WriteFile(filepath.Join(cache, "main.tf"), []byte(cached), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	mm, err := masking.MaskDir(dir, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, _ := os.ReadFile(filepath.Join(dir, "policy.json"))
-	if strings.Contains(string(got), "acme-secret-bucket") {
-		t.Errorf("unknown ARN not masked in .json:\n%s", got)
-	}
-	if len(mm) == 0 {
-		t.Error("MaskDir should return newly discovered values")
-	}
-	gotCache, _ := os.ReadFile(filepath.Join(cache, "main.tf"))
-	if string(gotCache) != cached {
-		t.Error(".terraform cache must not be rewritten")
+	if got := masking.UnresolvedPlaceholders("no placeholders here", mm); len(got) != 0 {
+		t.Errorf("expected none, got %v", got)
 	}
 }
 

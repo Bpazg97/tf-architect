@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// AnalysisResult is Claude's response to the architecture analysis prompt.
+// AnalysisResult is the model's response to the architecture analysis prompt.
 type AnalysisResult struct {
 	Ready           bool     `json:"ready"`
 	Missing         []string `json:"missing"`
@@ -16,7 +16,7 @@ type AnalysisResult struct {
 	ParseFailed bool `json:"-"`
 }
 
-// BuildAnalysisPrompt returns the prompt sent to Claude for the initial analysis phase.
+// BuildAnalysisPrompt returns the prompt sent to the model for the initial analysis phase.
 func BuildAnalysisPrompt(markdown string) string {
 	return fmt.Sprintf(`Analyze the following architecture document and respond with ONLY valid JSON — no other text.
 
@@ -42,7 +42,7 @@ Architecture document:
 %s`, markdown)
 }
 
-// ParseAnalysisJSON extracts and parses the JSON analysis from Claude's response.
+// ParseAnalysisJSON extracts and parses the JSON analysis from the model's response.
 // Handles responses where JSON is wrapped in markdown code fences.
 func ParseAnalysisJSON(raw string) AnalysisResult {
 	// Try to extract JSON from ```json ... ``` fences first
@@ -64,7 +64,7 @@ func ParseAnalysisJSON(raw string) AnalysisResult {
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
 		return AnalysisResult{
 			Ready:       false,
-			Missing:     []string{"Unable to parse architecture analysis — Claude response was not valid JSON"},
+			Missing:     []string{"Unable to parse architecture analysis — the model response was not valid JSON"},
 			ParseFailed: true,
 		}
 	}
@@ -81,10 +81,13 @@ func BuildQuestions(missing, inconsistencies []string) []string {
 	return questions
 }
 
-// BuildClarifyPrompt constructs the follow-up prompt after the user answers questions.
-func BuildClarifyPrompt(questions, answers []string) string {
+// BuildClarifyPrompt constructs the follow-up prompt after the user answers
+// questions. Calls are stateless, so it carries the analysis being refined.
+func BuildClarifyPrompt(analysisJSON string, questions, answers []string) string {
 	var sb strings.Builder
-	sb.WriteString("The following clarifications were provided by the user:\n\n")
+	sb.WriteString("Your previous architecture analysis:\n")
+	sb.WriteString(analysisJSON)
+	sb.WriteString("\n\nThe following clarifications were provided by the user:\n\n")
 	for i, q := range questions {
 		a := "(no answer provided)"
 		if i < len(answers) && answers[i] != "" {

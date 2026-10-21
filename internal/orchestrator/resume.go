@@ -20,9 +20,8 @@ const (
 )
 
 type ResumeDecision struct {
-	Mode        ResumeMode
-	Session     *state.Session
-	ContextBlob string
+	Mode    ResumeMode
+	Session *state.Session
 	// PrevMaskMap is the previous version's mask map (ModeDocChanged only):
 	// reusing it keeps placeholders stable across document versions.
 	PrevMaskMap masking.MaskMap
@@ -56,20 +55,12 @@ func DecideResume(docPath string, mgr *state.Manager, custom ...string) (*Resume
 
 	// CASE 2: Same hash, completed → validate only
 	if prev.DocHash == currentHash && prev.CurrentPhase == state.PhaseDone {
-		return &ResumeDecision{
-			Mode:        ModeValidateOnly,
-			Session:     prev,
-			ContextBlob: buildContextBlob(prev),
-		}, nil
+		return &ResumeDecision{Mode: ModeValidateOnly, Session: prev}, nil
 	}
 
 	// CASE 3: Same hash, interrupted → resume from checkpoint
 	if prev.DocHash == currentHash {
-		return &ResumeDecision{
-			Mode:        ModeResume,
-			Session:     prev,
-			ContextBlob: buildContextBlob(prev),
-		}, nil
+		return &ResumeDecision{Mode: ModeResume, Session: prev}, nil
 	}
 
 	// CASE 4: Hash changed → document was modified.
@@ -80,7 +71,7 @@ func DecideResume(docPath string, mgr *state.Manager, custom ...string) (*Resume
 	if prev.MaskMapPath != "" {
 		// Fail closed: without the map the diff would carry raw values.
 		if prevMM, err = masking.LoadMaskMap(prev.MaskMapPath); err != nil {
-			return nil, fmt.Errorf("loading previous mask map: %w", err)
+			return nil, maskingError("loading the previous mask map", err)
 		}
 	}
 	if len(custom) > 0 {
@@ -96,20 +87,18 @@ func DecideResume(docPath string, mgr *state.Manager, custom ...string) (*Resume
 		DiffSummary:     diffSummary,
 		GeneratedFiles:  prev.GeneratedFiles,
 	}
-	// The previous run's context, plus the diff it must now apply.
-	view := *prev
-	view.DiffSummary = diffSummary
 	return &ResumeDecision{
 		Mode:        ModeDocChanged,
 		Session:     newSession,
-		ContextBlob: buildContextBlob(&view),
 		PrevMaskMap: prevMM,
 	}, nil
 }
 
+// buildContextBlob describes the session so far. Calls are stateless, so it
+// is sent with every query.
 func buildContextBlob(s *state.Session) string {
 	var sb strings.Builder
-	sb.WriteString("## PREVIOUS SESSION CONTEXT\n\n")
+	sb.WriteString("## SESSION CONTEXT\n\n")
 	sb.WriteString(fmt.Sprintf("Document: %s\n", s.DocPath))
 	sb.WriteString(fmt.Sprintf("Last completed phase: %s\n", string(s.CurrentPhase)))
 	if s.LastCheckpoint.GenerateStep != "" {

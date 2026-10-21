@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"tf-architect/internal/llm"
 	"tf-architect/internal/masking"
 	"tf-architect/internal/orchestrator"
 	"tf-architect/internal/state"
@@ -237,7 +238,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		systemPrompt = string(data)
 	}
 
-	orch := orchestrator.New(workDir, outputDir, systemPrompt, noMaskFlag)
+	orch := orchestrator.New(workDir, outputDir, systemPrompt, &llm.ClaudeCLI{}, noMaskFlag)
 
 	fmt.Println(paint(ansiBold, "tf-architect ") + paint(ansiDim, version))
 	fmt.Println(paint(ansiDim, strings.Repeat("─", 45)))
@@ -248,10 +249,6 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	orch.OnStatus = func(msg string) {
 		fmt.Println(styleStatus(msg))
-	}
-
-	orch.OnChunk = func(chunk string) {
-		fmt.Print(paint(ansiDim, chunk))
 	}
 
 	orch.OnQuestion = func(questions []string) []string {
@@ -328,10 +325,8 @@ func parseCustomSensitive(line string) (values, short []string) {
 }
 
 // handleInterrupt keeps the first Ctrl-C from killing the process outright:
-// onFirst stops further Claude calls, the running subprocess receives the
-// signal too and exits, so Run returns normally and de-masks the output
-// files. A second Ctrl-C exits immediately (files then stay masked until the
-// next run).
+// onFirst cancels the in-flight request and stops further ones, so Run
+// returns normally with its state saved. A second Ctrl-C exits immediately.
 func handleInterrupt(onFirst func()) (stop func()) {
 	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)

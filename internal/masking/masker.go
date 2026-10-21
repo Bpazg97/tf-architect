@@ -1,7 +1,6 @@
 package masking
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,8 +9,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-
-	"tf-architect/internal/fsutil"
 )
 
 // MaskMap maps placeholder → real value.
@@ -109,64 +106,26 @@ func UnmaskText(text string, mm MaskMap) string {
 	return text
 }
 
-// Unmask replaces placeholders with real values in-place in every text file
-// under dir. Unreadable or unwritable files are reported in the error but do
-// not stop processing.
-func Unmask(dir string, mm MaskMap) error {
-	return rewriteDir(dir, func(content string) string { return UnmaskText(content, mm) })
-}
-
-// MaskDir is the inverse of Unmask: it masks every text file under dir with
-// Mask, so both known real values and newly discovered sensitive values are
-// replaced. Used before Claude can read the directory. Returns the merged
-// MaskMap; any error means some file may still hold real values.
-func MaskDir(dir string, mm MaskMap) (MaskMap, error) {
-	err := rewriteDir(dir, func(content string) string {
-		masked, merged, _ := Mask(content, mm)
-		mm = merged
-		return masked
-	})
-	return mm, err
-}
-
-// rewriteDir applies fn to every text file under dir, writing only files
-// whose content changed.
-func rewriteDir(dir string, fn func(string) string) error {
-	var problems []string
-	walkErr := fsutil.WalkFiles(dir, func(path string, info os.FileInfo) error {
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			problems = append(problems, fmt.Sprintf("%s: read: %v", path, readErr))
-			return nil
+// UnresolvedPlaceholders returns, in order of first appearance, the
+// placeholder-shaped tokens in text that mm cannot resolve: values the model
+// invented or altered, which would be written to disk verbatim.
+func UnresolvedPlaceholders(text string, mm MaskMap) []string {
+	known := make(map[string]bool, len(mm))
+	for ph := range mm {
+		// arn:aws:RESOURCE_001 is matched by its RESOURCE_001 body.
+		for _, body := range placeholderRe.FindAllString(ph, -1) {
+			known[body] = true
 		}
-		if isBinary(data) {
-			return nil
-		}
-		content := fn(string(data))
-		if content == string(data) {
-			return nil
-		}
-		if writeErr := os.WriteFile(path, []byte(content), info.Mode()); writeErr != nil {
-			problems = append(problems, fmt.Sprintf("%s: write: %v", path, writeErr))
-		}
-		return nil
-	})
-	if walkErr != nil {
-		return walkErr
 	}
-	if len(problems) > 0 {
-		return fmt.Errorf("rewrite partial: %s", strings.Join(problems, "; "))
+	var unknown []string
+	seen := map[string]bool{}
+	for _, tok := range placeholderRe.FindAllString(text, -1) {
+		if !known[tok] && !seen[tok] {
+			seen[tok] = true
+			unknown = append(unknown, tok)
+		}
 	}
-	return nil
-}
-
-// isBinary reports whether data looks like a binary file (NUL in the head).
-func isBinary(data []byte) bool {
-	head := data
-	if len(head) > 8000 {
-		head = head[:8000]
-	}
-	return bytes.IndexByte(head, 0) >= 0
+	return unknown
 }
 
 // SaveMaskMap writes mm to path as JSON with 0600 permissions.

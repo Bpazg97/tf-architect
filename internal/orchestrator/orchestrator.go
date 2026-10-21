@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,30 +10,45 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tf-architect/internal/claude"
 	"tf-architect/internal/docs"
+	"tf-architect/internal/fileproto"
 	"tf-architect/internal/fsutil"
 	"tf-architect/internal/ingestion"
+	"tf-architect/internal/llm"
 	"tf-architect/internal/masking"
+	"tf-architect/internal/security"
 	"tf-architect/internal/state"
+	"tf-architect/internal/validation"
 )
 
 const maxClarifyRounds = 3
 
-const stepMarker = "STEP_COMPLETE:"
+// Task headers: every task prompt starts with one of them.
+const (
+	taskAnalyze = "## TASK: ANALYZE"
+	taskClarify = "## TASK: CLARIFY"
+	taskRoot    = "## TASK: MODULE root"
+	taskAdjust  = "## TASK: ADJUST"
+	taskFix     = "## TASK: FIX"
+	taskDocs    = "## TASK: DOCS"
+)
+
+// rootStep is the generate checkpoint recorded once the project is written.
+const rootStep = "root"
 
 // Orchestrator runs the tf-architect FSM.
 //
-// Security invariant: when masking is enabled, nothing sensitive reaches
-// Claude.
-//   - Every prompt and the system prompt pass through maskText inside the
-//     client (single choke point, fail closed).
-//   - Claude runs confined to outputDir with file tools only, so it cannot
-//     read the source document, session state or mask.json.
-//   - outputDir is masked before the first Claude call and de-masked once,
-//     when Run returns. Validators run on a de-masked temporary copy.
+// Security invariant: when masking is enabled, nothing sensitive reaches the
+// AI provider.
+//   - The model has no tools: it only sees the text tf-architect puts in a
+//     prompt, and returns files in the fileproto text protocol.
+//   - Every prompt and the system prompt pass through outgoing inside the
+//     llm.Client (single choke point, fail closed), which masks them.
+//   - outputDir always holds real values: project files are masked when they
+//     are placed in a prompt, and model output is de-masked when written.
 type Orchestrator struct {
-	client    *claude.Client
+	client    *llm.Client
+	provider  llm.Provider
 	stMgr     *state.Manager
 	workDir   string
 	outputDir string
@@ -45,15 +62,16 @@ type Orchestrator struct {
 	CustomSensitive []string
 
 	interrupted atomic.Bool
+	ctx         context.Context
+	cancel      context.CancelFunc
 
 	// Callbacks wired by the CLI/TUI layer
 	OnQuestion func(questions []string) []string
 	OnStatus   func(msg string)
-	OnChunk    func(chunk string)
 }
 
-// maskingNote tells Claude how to treat placeholders, whatever system prompt
-// the user supplied.
+// maskingNote tells the model how to treat placeholders, whatever system
+// prompt the user supplied.
 const maskingNote = `
 
 ## MASKED VALUES
@@ -73,19 +91,27 @@ func withMaskingNote(systemPrompt string, noMask bool) string {
 	return systemPrompt + maskingNote
 }
 
-func New(workDir, outputDir, systemPrompt string, noMask bool) *Orchestrator {
-	systemPrompt = withMaskingNote(systemPrompt, noMask)
-	return &Orchestrator{
-		client:    claude.New(outputDir, systemPrompt),
+// New returns an Orchestrator that writes the project to outputDir and talks
+// to p with agents (AGENTS.md) as the system prompt.
+func New(workDir, outputDir, agents string, p llm.Provider, noMask bool) *Orchestrator {
+	ctx, cancel := context.WithCancel(context.Background())
+	o := &Orchestrator{
+		client:    llm.NewClient(p, withMaskingNote(agents, noMask)),
+		provider:  p,
 		stMgr:     state.NewManager(workDir),
 		workDir:   workDir,
 		outputDir: outputDir,
 		noMask:    noMask,
+		ctx:       ctx,
+		cancel:    cancel,
 	}
+	// Set even with noMask: the client refuses to send without a gate.
+	o.client.SetGate(o.outgoing)
+	return o
 }
 
 // status reports progress to the user. Placeholders are resolved for display
-// only; this text never goes to Claude.
+// only; this text never goes to the provider.
 func (o *Orchestrator) status(format string, args ...interface{}) {
 	if o.OnStatus != nil {
 		o.OnStatus(o.display(fmt.Sprintf(format, args...)))
@@ -99,19 +125,31 @@ func (o *Orchestrator) display(text string) string {
 	return masking.UnmaskText(text, o.maskMap)
 }
 
-// Interrupt stops the run at the next Claude call: nothing more is sent and
-// Run returns, de-masking the output on the way out. Safe from any goroutine.
+// Interrupt stops the run: the in-flight request is cancelled, nothing more
+// is sent and Run returns. Safe from any goroutine.
 func (o *Orchestrator) Interrupt() {
 	o.interrupted.Store(true)
+	o.cancel()
 }
+
+var errInterrupted = errors.New("interrupted by user")
 
 // outgoing is the client's gate for every prompt: refuse after an interrupt,
 // otherwise mask.
 func (o *Orchestrator) outgoing(text string) (string, error) {
 	if o.interrupted.Load() {
-		return "", fmt.Errorf("interrupted by user")
+		return "", errInterrupted
 	}
 	return o.maskText(text)
+}
+
+// maskingError is the fail-closed stop for any masking or mask map failure.
+func maskingError(action string, err error) error {
+	return security.New(
+		fmt.Sprintf("Masking failed while %s: %v.", action, err),
+		"Without a working mask, real infrastructure values could be sent to the AI provider.",
+		"Check that the session directory (.tf-architect) is readable and writable, then re-run the command.",
+	)
 }
 
 // maskText masks sensitive values in text using the session mask map,
@@ -121,11 +159,11 @@ func (o *Orchestrator) maskText(text string) (string, error) {
 		return text, nil
 	}
 	if o.maskMapPath == "" {
-		return "", fmt.Errorf("mask map not initialised (aborting to prevent data leak)")
+		return "", maskingError("masking text", errors.New("mask map not initialised"))
 	}
 	masked, mm, err := masking.Mask(text, o.maskMap)
 	if err != nil {
-		return "", fmt.Errorf("masking text: %w", err)
+		return "", maskingError("masking text", err)
 	}
 	if err := o.saveMaskMap(mm); err != nil {
 		return "", err
@@ -136,7 +174,7 @@ func (o *Orchestrator) maskText(text string) (string, error) {
 func (o *Orchestrator) saveMaskMap(mm masking.MaskMap) error {
 	if len(mm) != len(o.maskMap) {
 		if err := masking.SaveMaskMap(o.maskMapPath, mm); err != nil {
-			return fmt.Errorf("saving mask map (aborting to prevent data leak): %w", err)
+			return maskingError("saving the mask map", err)
 		}
 	}
 	o.maskMap = mm
@@ -151,7 +189,7 @@ func (o *Orchestrator) initMasking(sess *state.Session, prevMM masking.MaskMap) 
 	if sess.MaskMapPath != "" {
 		loaded, err := masking.LoadMaskMap(sess.MaskMapPath)
 		if err != nil {
-			return fmt.Errorf("loading mask map (aborting to prevent data leak): %w", err)
+			return maskingError("loading the mask map", err)
 		}
 		mm = loaded
 	} else {
@@ -160,48 +198,114 @@ func (o *Orchestrator) initMasking(sess *state.Session, prevMM masking.MaskMap) 
 	mm = masking.AddCustom(mm, o.CustomSensitive)
 	// Written even when empty: a recorded MaskMapPath must always load.
 	if err := masking.SaveMaskMap(sess.MaskMapPath, mm); err != nil {
-		return fmt.Errorf("saving mask map (aborting to prevent data leak): %w", err)
+		return maskingError("saving the mask map", err)
 	}
 	o.maskMap, o.maskMapPath = mm, sess.MaskMapPath
 	return nil
 }
 
-// maskOutput masks every text file in outputDir. Idempotent.
-func (o *Orchestrator) maskOutput() error {
-	mm, err := masking.MaskDir(o.outputDir, o.maskMap)
-	if err != nil {
-		return fmt.Errorf("masking %s (aborting to prevent data leak): %w", o.outputDir, err)
-	}
-	return o.saveMaskMap(mm)
-}
-
-func (o *Orchestrator) unmaskOutput() {
-	if len(o.maskMap) == 0 {
-		return
-	}
-	o.status("De-masking generated files...")
-	if err := masking.Unmask(o.outputDir, o.maskMap); err != nil {
-		o.status("Warning: %v", err)
-	}
-}
-
-// checkOutputDir refuses an output directory Claude could use to reach the
-// source document or the session state (which holds mask.json).
+// checkOutputDir refuses an output directory holding the source document or
+// the session state (which holds mask.json): project files are sent to the
+// model, so neither may be among them.
 func (o *Orchestrator) checkOutputDir(docPath string) error {
 	stateDir := filepath.Dir(o.stMgr.BaseDir)
 	for _, p := range []string{docPath, stateDir} {
 		if rel, err := filepath.Rel(o.outputDir, p); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("output directory %s must not contain %s: Claude can read every file in it", o.outputDir, p)
+			return security.New(
+				fmt.Sprintf("Output directory %s must not contain %s.", o.outputDir, p),
+				"Project files are sent to the AI provider, so the source document or the mask map could be read from it.",
+				"Choose an output directory (--output) outside the document's location and the .tf-architect state directory.",
+			)
 		}
 	}
 	return nil
+}
+
+// preflight lets the provider verify its isolation before any data is sent.
+func (o *Orchestrator) preflight() error {
+	if o.interrupted.Load() {
+		return errInterrupted
+	}
+	pf, ok := o.provider.(llm.Preflighter)
+	if !ok {
+		return nil
+	}
+	if err := pf.Preflight(o.ctx); err != nil {
+		return fmt.Errorf("%s preflight: %w", o.provider.Name(), err)
+	}
+	return nil
+}
+
+// ask sends one stateless task: its header, the current session context
+// (unless withContext is false) and body.
+func (o *Orchestrator) ask(sess *state.Session, header, body string, withContext bool) (string, error) {
+	var sb strings.Builder
+	sb.WriteString(header + "\n\n")
+	if withContext {
+		sb.WriteString(buildContextBlob(sess) + "\n")
+	}
+	sb.WriteString(body)
+	return o.client.Query(o.ctx, sb.String())
+}
+
+// askFiles sends a task whose answer is files in the protocol, and writes them.
+func (o *Orchestrator) askFiles(sess *state.Session, header, body string) error {
+	resp, err := o.ask(sess, header, body, true)
+	if err != nil {
+		return err
+	}
+	changes, warnings, err := fileproto.Parse(resp)
+	for _, w := range warnings {
+		o.status("Warning: %s", w)
+	}
+	if err != nil {
+		return err
+	}
+	if len(changes) == 0 {
+		o.status("Warning: the model returned no files")
+	}
+	return o.applyChanges(changes)
+}
+
+// applyChanges writes the model's files to outputDir with real values,
+// warning about placeholders the mask map cannot resolve.
+func (o *Orchestrator) applyChanges(changes []fileproto.Change) error {
+	if !o.noMask {
+		for _, c := range changes {
+			if u := masking.UnresolvedPlaceholders(c.Content, o.maskMap); len(u) > 0 {
+				o.status("Warning: %s contains unknown placeholders, written as-is: %s", c.Path, strings.Join(u, ", "))
+			}
+		}
+	}
+	if err := fileproto.Apply(o.outputDir, changes, func(s string) string {
+		return masking.UnmaskText(s, o.maskMap)
+	}); err != nil {
+		return err
+	}
+	for _, c := range changes {
+		verb := "wrote"
+		if c.Delete {
+			verb = "deleted"
+		}
+		o.status("  ✓ %s %s", verb, c.Path)
+	}
+	return nil
+}
+
+// renderProject returns the project files in the protocol, for edit tasks.
+func (o *Orchestrator) renderProject() (string, error) {
+	files, err := fileproto.ReadProject(o.outputDir, fileproto.DefaultBudget)
+	if err != nil {
+		return "", err
+	}
+	return fileproto.Render(files), nil
 }
 
 func (o *Orchestrator) Run(docPath string) error {
 	if err := o.checkOutputDir(docPath); err != nil {
 		return err
 	}
-	// Claude's working directory: it must exist before the first call.
+	// Validators run here even if the model returns no files.
 	if err := os.MkdirAll(o.outputDir, 0755); err != nil {
 		return fmt.Errorf("creating output dir: %w", err)
 	}
@@ -219,17 +323,13 @@ func (o *Orchestrator) Run(docPath string) error {
 	o.status("Mode: %s | Phase: %s", decision.Mode, sess.CurrentPhase)
 
 	if o.noMask {
-		o.status("Warning: --no-mask enabled — sensitive values will be sent to Claude")
-	} else {
-		if err := o.initMasking(sess, decision.PrevMaskMap); err != nil {
-			return err
-		}
-		// Single de-mask point: runs on every exit path, after the last
-		// Claude call. The next run re-masks before calling Claude again.
-		defer o.unmaskOutput()
+		o.status("Warning: --no-mask enabled — sensitive values will be sent to the AI provider")
+	} else if err := o.initMasking(sess, decision.PrevMaskMap); err != nil {
+		return err
 	}
-	o.client.SetSanitizer(o.outgoing)
-	o.client.SetContextBlob(decision.ContextBlob)
+	if err := o.preflight(); err != nil {
+		return err
+	}
 
 	// ── INGEST ───────────────────────────────────────────────────────────────
 	if sess.CurrentPhase.AtOrBefore(state.PhaseIngest) || sess.DocMarkdown == "" {
@@ -255,14 +355,6 @@ func (o *Orchestrator) Run(docPath string) error {
 		}
 	}
 
-	// Claude can read outputDir from here on: mask whatever is on disk,
-	// including files de-masked by a previous run or edited by the user.
-	if !o.noMask {
-		if err := o.maskOutput(); err != nil {
-			return err
-		}
-	}
-
 	// ── VALIDATE ONLY ────────────────────────────────────────────────────────
 	if decision.Mode == ModeValidateOnly {
 		o.status("Document unchanged. Re-running validation suite...")
@@ -274,13 +366,13 @@ func (o *Orchestrator) Run(docPath string) error {
 	// ── ANALYZE ──────────────────────────────────────────────────────────────
 	if sess.CurrentPhase.AtOrBefore(state.PhaseAnalyze) {
 		o.status("Analyzing architecture...")
-		analysisPrompt := BuildAnalysisPrompt(sess.DocMarkdown)
+		body := BuildAnalysisPrompt(sess.DocMarkdown)
 		if isDocChange {
-			analysisPrompt = "The document changed since the last run (see DOCUMENT CHANGED). " +
-				"Focus on what changed and which Terraform resources need modification.\n\n" + analysisPrompt
+			body = "The document changed since the last run (see DOCUMENT CHANGED). " +
+				"Focus on what changed and which Terraform resources need modification.\n\n" + body
 		}
-
-		analysisRaw, err := o.client.Query(analysisPrompt)
+		// A brand-new session has no context worth sending yet.
+		analysisRaw, err := o.ask(sess, taskAnalyze, body, decision.Mode != ModeNew)
 		if err != nil {
 			_ = o.stMgr.Save(sess)
 			return fmt.Errorf("analyze (state saved): %w", err)
@@ -356,13 +448,15 @@ func (o *Orchestrator) clarify(sess *state.Session) error {
 			cr.Answers[i] = masked
 		}
 
-		// Persist the round before sending to Claude (don't lose user answers on error)
+		// Persist the round before sending (don't lose user answers on error)
 		sess.Clarifications = append(sess.Clarifications, cr)
 		if err := o.stMgr.Save(sess); err != nil {
 			return err
 		}
 
-		reanalysisRaw, err := o.client.Query(BuildClarifyPrompt(questions, answers))
+		body := BuildClarifyPrompt(sess.AnalysisJSON, questions, answers) +
+			"\n\nArchitecture document:\n---\n" + sess.DocMarkdown
+		reanalysisRaw, err := o.ask(sess, taskClarify, body, true)
 		if err != nil {
 			return fmt.Errorf("clarify round %d (state saved): %w", round, err)
 		}
@@ -373,55 +467,35 @@ func (o *Orchestrator) clarify(sess *state.Session) error {
 }
 
 func (o *Orchestrator) generate(sess *state.Session, isDocChange bool) error {
-	o.status("Generating Terraform IaC in %s...", o.outputDir)
-
-	// Claude's working directory is outputDir: paths in prompts are relative.
-	const checkpointNote = "After writing each module, output exactly: " + stepMarker + "<module_name>\n" +
-		"This marker is used for progress checkpointing."
-	lastStep := sess.LastCheckpoint.GenerateStep
-
-	var prompt string
 	switch {
+	case sess.LastCheckpoint.GenerateStep == rootStep:
+		o.status("Project already generated — skipping generation")
 	case isDocChange:
-		prompt = "Adjust the existing Terraform files in the current directory to reflect the document changes.\n" +
-			"List and read the existing files first. Only modify files that need to change. " +
-			"Do not touch unaffected resources.\n" + checkpointNote
-	case lastStep != "":
-		prompt = fmt.Sprintf(
-			"Generation was interrupted at step: %s\n"+
-				"Continue generating the remaining modules in the current directory. "+
-				"List the existing files first and do NOT regenerate them.\n%s",
-			lastStep, checkpointNote,
-		)
-	default:
-		prompt = fmt.Sprintf(
-			"Generate complete, production-grade Terraform IaC based on the analyzed architecture.\n"+
-				"Write all files to the current directory.\n\n"+
-				"Architecture context:\n%s\n\n%s",
-			sess.AnalysisJSON, checkpointNote,
-		)
-	}
-
-	err := o.client.StreamQuery(prompt, func(chunk string) {
-		if o.OnChunk != nil {
-			o.OnChunk(o.display(chunk))
+		o.status("Adjusting Terraform IaC in %s...", o.outputDir)
+		project, err := o.renderProject()
+		if err != nil {
+			return err
 		}
-		// Granular checkpoint per module
-		for _, step := range extractSteps(chunk) {
-			sess.LastCheckpoint = state.Checkpoint{
-				Phase:        state.PhaseGenerate,
-				GenerateStep: step,
-				CompletedAt:  time.Now(),
-			}
+		body := "Adjust the existing Terraform project to reflect the document changes (see DOCUMENT CHANGED).\n" +
+			"Return only the files that must change, in full. Do not touch unaffected resources.\n\n" +
+			"Current project files:\n" + project
+		if err := o.askFiles(sess, taskAdjust, body); err != nil {
 			_ = o.stMgr.Save(sess)
-			o.status("  ✓ Module complete: %s", step)
+			return fmt.Errorf("adjust (state saved): %w", err)
 		}
-	})
-	if err != nil {
-		_ = o.stMgr.Save(sess)
-		return fmt.Errorf("generate (state saved at step '%s'): %w",
-			sess.LastCheckpoint.GenerateStep, err)
+	default:
+		o.status("Generating Terraform IaC in %s...", o.outputDir)
+		body := "Generate the complete, production-grade Terraform project for the analyzed architecture: " +
+			"every module and the root files (versions.tf, providers.tf, main.tf, variables.tf, outputs.tf, ...).\n" +
+			"Return every file in the output protocol, with paths relative to the project root.\n\n" +
+			"Architecture document:\n---\n" + sess.DocMarkdown
+		if err := o.askFiles(sess, taskRoot, body); err != nil {
+			_ = o.stMgr.Save(sess)
+			return fmt.Errorf("generate (state saved): %w", err)
+		}
 	}
+	sess.LastCheckpoint = state.Checkpoint{Phase: state.PhaseGenerate, GenerateStep: rootStep, CompletedAt: time.Now()}
+	_ = o.stMgr.Save(sess)
 
 	sess.GeneratedFiles = collectTFFiles(o.outputDir)
 	if len(sess.GeneratedFiles) == 0 {
@@ -440,12 +514,16 @@ func (o *Orchestrator) runValidation(sess *state.Session) error {
 
 	if !run.Passed {
 		o.status("Errors detected. Attempting auto-fix...")
-		fixPrompt := fmt.Sprintf(
-			"Validation errors:\n%s\n\nFix all errors in the Terraform files in the current directory. "+
-				"Do not touch files without errors.",
-			strings.Join(run.Errors, "\n"),
+		project, err := o.renderProject()
+		if err != nil {
+			return err
+		}
+		body := fmt.Sprintf(
+			"Validation errors:\n%s\n\nFix all errors. Return only the files you change, in full. "+
+				"Do not touch files without errors.\n\nCurrent project files:\n%s",
+			strings.Join(run.Errors, "\n"), project,
 		)
-		if _, err := o.client.Query(fixPrompt); err != nil {
+		if err := o.askFiles(sess, taskFix, body); err != nil {
 			_ = o.stMgr.Save(sess)
 			return fmt.Errorf("auto-fix (state saved): %w", err)
 		}
@@ -462,7 +540,13 @@ func (o *Orchestrator) runValidation(sess *state.Session) error {
 		if err := o.stMgr.Advance(sess, state.PhaseDocument, state.Checkpoint{}); err != nil {
 			return err
 		}
-		docs.Generate(o.client, sess, o.outputDir, func(msg string) { o.status("%s", msg) })
+		dc := &docsClient{o: o, sess: sess}
+		docs.Generate(dc, sess, o.outputDir, func(msg string) { o.status("%s", msg) })
+		// Docs are best-effort, but a security stop or an interrupt is not.
+		var se *security.Error
+		if errors.As(dc.err, &se) || errors.Is(dc.err, errInterrupted) {
+			return dc.err
+		}
 		if err := o.stMgr.Advance(sess, state.PhaseDone, state.Checkpoint{}); err != nil {
 			return err
 		}
@@ -486,24 +570,72 @@ func (o *Orchestrator) runValidation(sess *state.Session) error {
 	return nil
 }
 
-// extractSteps returns every module name announced in chunk.
-func extractSteps(chunk string) []string {
-	var steps []string
-	for {
-		idx := strings.Index(chunk, stepMarker)
-		if idx < 0 {
-			return steps
-		}
-		chunk = chunk[idx+len(stepMarker):]
-		end := strings.IndexAny(chunk, "\n \t")
-		if end < 0 {
-			end = len(chunk)
-		}
-		if step := chunk[:end]; step != "" {
-			steps = append(steps, step)
-		}
-		chunk = chunk[end:]
+// docsClient adapts the orchestrator to docs.Client: queries go through the
+// gate with the session context, and answers come back with real values
+// because the docs package writes them to disk.
+type docsClient struct {
+	o    *Orchestrator
+	sess *state.Session
+	err  error // last query error, which docs.Generate only reports
+}
+
+func (d *docsClient) Query(prompt string) (string, error) {
+	resp, err := d.o.ask(d.sess, taskDocs, prompt, true)
+	if err != nil {
+		d.err = err
+		return "", err
 	}
+	return masking.UnmaskText(resp, d.o.maskMap), nil
+}
+
+// maxStageOutput bounds raw validator output forwarded to auto-fix.
+const maxStageOutput = 2000
+
+// validate runs the suite on outputDir (real values) and returns a
+// ValidationRun whose errors are masked before they are stored or sent.
+func (o *Orchestrator) validate(label string) (state.ValidationRun, error) {
+	results, suiteErr := validation.New(o.outputDir).Run()
+
+	run := state.ValidationRun{
+		RunAt:   time.Now(),
+		Passed:  suiteErr == nil,
+		Results: make(map[string]bool),
+	}
+	for _, r := range results {
+		run.Results[r.Stage] = r.Passed
+		icon := "✓"
+		switch {
+		case r.Skipped:
+			icon = "–"
+		case !r.Passed:
+			icon = "✗"
+		}
+		o.status("  %s%s %s", label, icon, r.Stage)
+
+		errs := r.Errors
+		if !r.Passed && len(errs) == 0 && r.Output != "" {
+			// Stages without structured errors (tflint, checkov, init).
+			errs = []string{r.Stage + ": " + truncate(strings.TrimSpace(r.Output), maxStageOutput)}
+		}
+		for _, e := range errs {
+			// The model knows paths relative to the project root only.
+			e = strings.ReplaceAll(e, o.outputDir+string(filepath.Separator), "")
+			e = strings.ReplaceAll(e, o.outputDir, ".")
+			masked, err := o.maskText(e)
+			if err != nil {
+				return state.ValidationRun{}, err
+			}
+			run.Errors = append(run.Errors, masked)
+		}
+	}
+	return run, nil
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "... (truncated)"
 }
 
 // collectTFFiles returns the .tf files under dir, relative to dir.
