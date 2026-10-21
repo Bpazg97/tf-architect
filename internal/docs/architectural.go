@@ -10,11 +10,9 @@ import (
 )
 
 // SessionData is the subset of state.Session needed for doc generation.
-// Using a local struct avoids an import cycle with the orchestrator package.
 type SessionData struct {
 	DocPath        string
 	DocMarkdown    string
-	AnalysisJSON   string
 	Clarifications []ClarificationEntry
 	GeneratedFiles []string
 	CreatedAt      time.Time
@@ -56,9 +54,13 @@ func GenerateArchitecturalDocs(client Client, sess SessionData, outputDir string
 
 	files := map[string]string{
 		filepath.Join(docsDir, "ARCHITECTURE.md"): adocs.Architecture,
-		filepath.Join(docsDir, "RUNBOOK.md"):       adocs.Runbook,
-		filepath.Join(docsDir, "VARIABLES.md"):     adocs.Variables,
-		filepath.Join(docsDir, "CHANGELOG.md"):     changelogStub(sess),
+		filepath.Join(docsDir, "RUNBOOK.md"):      adocs.Runbook,
+		filepath.Join(docsDir, "VARIABLES.md"):    adocs.Variables,
+	}
+	// CHANGELOG.md is maintained manually after the first run.
+	changelog := filepath.Join(docsDir, "CHANGELOG.md")
+	if _, err := os.Stat(changelog); os.IsNotExist(err) {
+		files[changelog] = changelogStub(sess)
 	}
 
 	for path, content := range files {

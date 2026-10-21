@@ -105,9 +105,10 @@ func TestUnmask(t *testing.T) {
 		t.Error("placeholder still present after unmask")
 	}
 
+	// MaskDir masks every text file, so Unmask must restore every text file.
 	notf, _ := os.ReadFile(filepath.Join(dir, "notes.txt"))
-	if !strings.Contains(string(notf), "IP_PRIVATE_001") {
-		t.Error("non-.tf file should not be modified by Unmask")
+	if string(notf) != "10.0.1.5" {
+		t.Errorf("placeholder not restored in .txt: %s", notf)
 	}
 }
 
@@ -257,7 +258,8 @@ owner_tag  = "tmobilitat"`
 		"ACCOUNT_001":    "123456789012",
 	}
 
-	if err := masking.MaskDir(dir, mm); err != nil {
+	mm, err := masking.MaskDir(dir, mm)
+	if err != nil {
 		t.Fatalf("MaskDir() error: %v", err)
 	}
 	tf, _ := os.ReadFile(filepath.Join(dir, "main.tf"))
@@ -268,9 +270,10 @@ owner_tag  = "tmobilitat"`
 	if strings.Contains(string(tfvars), "123456789012") {
 		t.Errorf("account ID still present in .tfvars after MaskDir:\n%s", tfvars)
 	}
+	// Claude can read every file in the dir, so every text file is masked.
 	txt, _ := os.ReadFile(filepath.Join(dir, "notes.txt"))
-	if !strings.Contains(string(txt), "10.0.1.5") {
-		t.Error("non-masked-suffix file should not be modified by MaskDir")
+	if strings.Contains(string(txt), "10.0.1.5") {
+		t.Error("real value still present in .txt after MaskDir")
 	}
 
 	if err := masking.Unmask(dir, mm); err != nil {
@@ -329,5 +332,121 @@ func TestUnmaskPlaceholderPrefixCollision(t *testing.T) {
 	want := "a = \"111111111111\"\nb = \"222222222222\""
 	if string(got) != want {
 		t.Errorf("prefix collision corrupted output:\nwant: %s\ngot:  %s", want, got)
+	}
+}
+
+func TestMaskDirMasksUnknownValuesAndSkipsTerraformCache(t *testing.T) {
+	dir := t.TempDir()
+	policy := `{"Resource": "arn:aws:s3:::acme-secret-bucket"}`
+	if err := os.WriteFile(filepath.Join(dir, "policy.json"), []byte(policy), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cache := filepath.Join(dir, ".terraform", "modules")
+	if err := os.MkdirAll(cache, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cached := `cidr = "10.9.9.0/24"`
+	if err := os.WriteFile(filepath.Join(cache, "main.tf"), []byte(cached), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	mm, err := masking.MaskDir(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "policy.json"))
+	if strings.Contains(string(got), "acme-secret-bucket") {
+		t.Errorf("unknown ARN not masked in .json:\n%s", got)
+	}
+	if len(mm) == 0 {
+		t.Error("MaskDir should return newly discovered values")
+	}
+	gotCache, _ := os.ReadFile(filepath.Join(cache, "main.tf"))
+	if string(gotCache) != cached {
+		t.Error(".terraform cache must not be rewritten")
+	}
+}
+
+func TestMaskKnownValueIsBounded(t *testing.T) {
+	mm := masking.MaskMap{"TAG_VALUE_001": "dev", "IP_PRIVATE_001": "10.0.0.1"}
+	in := `device_type = "x"
+stage: dev
+prefix = "my-dev-vpc"
+other = "10.0.0.15"`
+	masked, mm, _ := masking.Mask(in, mm)
+	if !strings.Contains(masked, "device_type") {
+		t.Errorf("substring of identifier corrupted:\n%s", masked)
+	}
+	if !strings.Contains(masked, "stage: TAG_VALUE_001") || !strings.Contains(masked, "my-TAG_VALUE_001-vpc") {
+		t.Errorf("known value without pattern context not masked:\n%s", masked)
+	}
+	if strings.Contains(masked, "IP_PRIVATE_0015") {
+		t.Errorf("longer IP corrupted by shorter known IP:\n%s", masked)
+	}
+	if got := masking.UnmaskText(masked, mm); got != in {
+		t.Errorf("round trip left placeholders:\n%s", got)
+	}
+}
+
+func TestMaskAlreadyMaskedIsStable(t *testing.T) {
+	_, mm, _ := masking.Mask(`Name = "acme-web"`, nil)
+	masked, _, _ := masking.Mask(`Name = "acme-web"`, mm)
+	again, mm2, _ := masking.Mask(masked, mm)
+	if again != masked {
+		t.Errorf("re-masking changed text: %q -> %q", masked, again)
+	}
+	if len(mm2) != len(mm) {
+		t.Errorf("re-masking added placeholder-to-placeholder entries: %v", mm2)
+	}
+}
+
+func TestUnmaskNestedPlaceholders(t *testing.T) {
+	_, mm, _ := masking.Mask("account 123456789012", nil)
+	masked, mm, _ := masking.Mask(`role = "arn:aws:iam::123456789012:role/acme-admin"`, mm)
+	if strings.Contains(masked, "acme-admin") || strings.Contains(masked, "123456789012") {
+		t.Fatalf("ARN with known account not fully masked: %s", masked)
+	}
+	want := `role = "arn:aws:iam::123456789012:role/acme-admin"`
+	for i := 0; i < 20; i++ { // map order varies between runs
+		if got := masking.UnmaskText(masked, mm); got != want {
+			t.Fatalf("nested unmask failed:\nwant %s\ngot  %s", want, got)
+		}
+	}
+}
+
+func TestAnywhereCIDRNotMasked(t *testing.T) {
+	masked, _, _ := masking.Mask(`cidr_blocks = ["0.0.0.0/0"]`, nil)
+	if !strings.Contains(masked, "0.0.0.0/0") {
+		t.Errorf("0.0.0.0/0 must stay visible for ingress review: %s", masked)
+	}
+}
+
+func TestInterpolationNotMaskedAsTag(t *testing.T) {
+	in := `Name = "${var.project}-vpc"`
+	masked, _, _ := masking.Mask(in, nil)
+	if masked != in {
+		t.Errorf("interpolation masked: %s", masked)
+	}
+}
+
+func TestCustomValuesMaskedAnyCaseAndPosition(t *testing.T) {
+	mm := masking.AddCustom(nil, []string{"Phoenix", "ab", "acme"})
+	in := `Project Phoenix: phoenix-api, PHOENIXDB, tag = "TAG_VALUE_001", acme.`
+	masked, mm, _ := masking.Mask(in, mm)
+	for _, leak := range []string{"Phoenix", "phoenix", "PHOENIX", "acme"} {
+		if strings.Contains(masked, leak) {
+			t.Errorf("custom value %q leaked: %s", leak, masked)
+		}
+	}
+	if !strings.Contains(masked, "TAG_VALUE_001") {
+		t.Errorf("existing placeholder corrupted: %s", masked)
+	}
+	for _, real := range mm {
+		if real == "ab" {
+			t.Error("custom value shorter than MinCustomLen must be ignored")
+		}
+	}
+	if got := masking.UnmaskText(masked, mm); got != in {
+		t.Errorf("round trip mismatch:\nwant %s\ngot  %s", in, got)
 	}
 }

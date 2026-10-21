@@ -3,6 +3,7 @@ package validation_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"tf-architect/internal/validation"
@@ -92,5 +93,74 @@ resource "aws_security_group" "bad" {
 
 	if result.Passed {
 		t.Error("expected golden rules to fail due to open ingress")
+	}
+}
+
+func TestGoldenRulesAuditAllowsOpenEgress(t *testing.T) {
+	dir := t.TempDir()
+	content := `
+resource "aws_security_group" "ok" {
+  ingress {
+    cidr_blocks = ["10.0.0.0/16"]
+  }
+  egress {
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+resource "aws_security_group_rule" "out" {
+  type        = "egress"
+  cidr_blocks = ["0.0.0.0/0"]
+}
+`
+	_ = os.WriteFile(filepath.Join(dir, "main.tf"), []byte(content), 0644)
+	for _, e := range validation.New(dir).RunGoldenRulesAudit().Errors {
+		if strings.Contains(e, "ingress") {
+			t.Errorf("egress 0.0.0.0/0 reported as open ingress: %s", e)
+		}
+	}
+}
+
+func TestGoldenRulesAuditDetectsOpenIngressRuleResources(t *testing.T) {
+	cases := map[string]string{
+		"sg_rule": `resource "aws_security_group_rule" "in" {
+  cidr_blocks = ["0.0.0.0/0"]
+  type        = "ingress"
+}`,
+		"vpc_ingress_rule": `resource "aws_vpc_security_group_ingress_rule" "in" {
+  cidr_ipv4 = "0.0.0.0/0"
+}`,
+	}
+	for name, content := range cases {
+		dir := t.TempDir()
+		_ = os.WriteFile(filepath.Join(dir, "main.tf"), []byte(content), 0644)
+		found := false
+		for _, e := range validation.New(dir).RunGoldenRulesAudit().Errors {
+			found = found || strings.Contains(e, "ingress")
+		}
+		if !found {
+			t.Errorf("%s: open ingress not detected", name)
+		}
+	}
+}
+
+func TestGoldenRulesAuditIgnoresTerraformCache(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "main.tf"), []byte(`terraform {
+  required_version = ">= 1.5"
+  required_providers {}
+  backend "s3" {}
+}
+provider "aws" {
+  default_tags {}
+}`), 0644)
+	cache := filepath.Join(dir, ".terraform", "modules", "x")
+	_ = os.MkdirAll(cache, 0755)
+	_ = os.WriteFile(filepath.Join(cache, "main.tf"), []byte(`resource "aws_security_group" "x" {
+  ingress {
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}`), 0644)
+	if r := validation.New(dir).RunGoldenRulesAudit(); !r.Passed {
+		t.Errorf("third-party module code in .terraform audited: %v", r.Errors)
 	}
 }

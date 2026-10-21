@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 )
 
 // Client wraps the Claude Code CLI (claude -p) as a subprocess.
-// Uses --bare --permission-mode bypassPermissions for fully automated runs.
+//
+// Claude runs confined to workDir: --restricted removes Bash and the other
+// code-running tools and keeps the file tools inside the working directory,
+// so it cannot read the source document, session state or mask.json.
 // Context is injected explicitly into prompts as a workaround for the
 // known --resume context-loss bug in -p mode.
 type Client struct {
@@ -17,7 +21,11 @@ type Client struct {
 	systemPrompt string
 	sessionID    string
 	contextBlob  string
+	sanitize     func(string) (string, error)
 }
+
+// fileTools are the only tools Claude gets: read and edit files in workDir.
+const fileTools = "Read,Write,Edit,Glob,Grep"
 
 func New(workDir, systemPrompt string) *Client {
 	return &Client{
@@ -26,12 +34,15 @@ func New(workDir, systemPrompt string) *Client {
 	}
 }
 
-func (c *Client) SetContextBlob(blob string) {
-	c.contextBlob = blob
+// SetSanitizer installs a function applied to every prompt and to the system
+// prompt before they leave the process. If it fails, nothing is sent.
+func (c *Client) SetSanitizer(fn func(string) (string, error)) {
+	c.sanitize = fn
 }
 
-func (c *Client) GetSessionID() string {
-	return c.sessionID
+// SetContextBlob sets context that is prepended once to the next query.
+func (c *Client) SetContextBlob(blob string) {
+	c.contextBlob = blob
 }
 
 // Query sends a prompt and returns the full accumulated text response.
@@ -49,10 +60,22 @@ func (c *Client) StreamQuery(prompt string, onChunk func(string)) error {
 	finalPrompt := prompt
 	if c.contextBlob != "" {
 		finalPrompt = c.contextBlob + "\n\n---\n\n" + prompt
-		c.contextBlob = ""
 	}
 
-	args := c.buildArgs(finalPrompt)
+	systemPrompt := c.systemPrompt
+	if c.sanitize != nil {
+		var err error
+		if finalPrompt, err = c.sanitize(finalPrompt); err != nil {
+			return fmt.Errorf("sanitizing prompt (nothing sent): %w", err)
+		}
+		if systemPrompt, err = c.sanitize(systemPrompt); err != nil {
+			return fmt.Errorf("sanitizing system prompt (nothing sent): %w", err)
+		}
+	}
+
+	c.contextBlob = ""
+
+	args := c.buildArgs(systemPrompt, finalPrompt)
 	cmd := exec.Command("claude", args...)
 	cmd.Dir = c.workDir
 
@@ -68,6 +91,22 @@ func (c *Client) StreamQuery(prompt string, onChunk func(string)) error {
 		return fmt.Errorf("starting claude: %w (is claude installed?)", err)
 	}
 
+	resultErr, scanErr := c.readEvents(stdout, onChunk)
+	waitErr := cmd.Wait()
+	switch {
+	case resultErr != nil:
+		return fmt.Errorf("%w%s", resultErr, formatStderr(stderr.String()))
+	case scanErr != nil:
+		return fmt.Errorf("reading claude output: %w", scanErr)
+	case waitErr != nil:
+		return fmt.Errorf("claude exited: %w%s", waitErr, formatStderr(stderr.String()))
+	}
+	return nil
+}
+
+// readEvents consumes the stream-json output until EOF, so the process can
+// always be reaped. Returns the error reported by a result event, if any.
+func (c *Client) readEvents(stdout io.Reader, onChunk func(string)) (resultErr, scanErr error) {
 	scanner := bufio.NewScanner(stdout)
 	// 4 MB buffer for large JSON lines (tool outputs can be large)
 	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
@@ -116,19 +155,16 @@ func (c *Client) StreamQuery(prompt string, onChunk func(string)) error {
 			}
 			if isErr, _ := event["is_error"].(bool); isErr {
 				result, _ := event["result"].(string)
-				return fmt.Errorf("claude error: %s", result)
+				resultErr = fmt.Errorf("claude error: %s", result)
 			}
 		}
 	}
-
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("reading claude output: %w", err)
+		// Drain so the child does not block on a full pipe before Wait.
+		_, _ = io.Copy(io.Discard, stdout)
+		return resultErr, err
 	}
-
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("claude exited: %w%s", err, formatStderr(stderr.String()))
-	}
-	return nil
+	return resultErr, nil
 }
 
 // formatStderr returns the tail of stderr for error context (empty if none).
@@ -144,18 +180,21 @@ func formatStderr(s string) string {
 	return " — stderr: " + s
 }
 
-func (c *Client) buildArgs(prompt string) []string {
+func (c *Client) buildArgs(systemPrompt, prompt string) []string {
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
 		"--verbose",
 		"--bare",
-		"--permission-mode", "bypassPermissions",
-		"--allowedTools", "Bash,Read,Write",
+		"--restricted",
+		"--strict-mcp-config",
+		"--tools", fileTools,
+		"--permission-mode", "acceptEdits",
+		"--permission-prompts", "none",
 	}
 
-	if c.systemPrompt != "" {
-		args = append(args, "--system-prompt", c.systemPrompt)
+	if systemPrompt != "" {
+		args = append(args, "--system-prompt", systemPrompt)
 	}
 
 	if c.sessionID != "" {

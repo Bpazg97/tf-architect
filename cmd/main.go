@@ -4,13 +4,17 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
+	"tf-architect/internal/masking"
 	"tf-architect/internal/orchestrator"
 	"tf-architect/internal/state"
 	"tf-architect/internal/validation"
+	"tf-architect/prompts"
 )
 
 var (
@@ -24,13 +28,16 @@ var (
 // ── TUI styling ──────────────────────────────────────────────────────────────
 // Minimal ANSI styling. Disabled when stdout is not a TTY or NO_COLOR is set.
 
-var colorEnabled = func() bool {
-	if os.Getenv("NO_COLOR") != "" {
-		return false
-	}
-	fi, err := os.Stdout.Stat()
+var colorEnabled = os.Getenv("NO_COLOR") == "" && isTerminal(os.Stdout)
+
+// stdin is shared by every prompt: separate bufio readers on os.Stdin would
+// each buffer input the others never see.
+var stdin = bufio.NewReader(os.Stdin)
+
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
-}()
+}
 
 const (
 	ansiBold   = "1"
@@ -71,7 +78,9 @@ func main() {
 	root := &cobra.Command{
 		Use:     "tf-architect",
 		Version: version,
-		Short:   "Generate and validate production Terraform IaC from architecture documents",
+		// Runtime errors are not usage errors: print the error only.
+		SilenceUsage: true,
+		Short:        "Generate and validate production Terraform IaC from architecture documents",
 		Long: `tf-architect turns architecture documents (PDF, DOCX, MD, TXT) into
 production-grade AWS Terraform — and validates existing Terraform projects.
 
@@ -126,7 +135,7 @@ Supported formats: PDF, DOCX, MD, TXT`,
 	}
 	runCmd.Flags().StringVarP(&outputDir, "output", "o", "", "Output directory for Terraform files (default: <docname>-tf/)")
 	runCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force full re-run, ignoring saved session state")
-	runCmd.Flags().StringVar(&systemFile, "system-file", "", "Path to custom system prompt file (default: embedded golden rules)")
+	runCmd.Flags().StringVar(&systemFile, "system-file", "", "Path to custom system prompt file (default: built-in golden rules)")
 	runCmd.Flags().BoolVar(&noMaskFlag, "no-mask", false, "Disable sensitive value masking (debug only — never use in production)")
 
 	statusCmd := &cobra.Command{
@@ -195,26 +204,31 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("document not found: %s", docPath)
 	}
 
-	workDir, _ := os.Getwd()
+	workDir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
 
 	if outputDir == "" {
 		base := strings.TrimSuffix(filepath.Base(docPath), filepath.Ext(docPath))
 		outputDir = filepath.Join(workDir, base+"-tf")
 	}
+	if outputDir, err = filepath.Abs(outputDir); err != nil {
+		return fmt.Errorf("resolving output path: %w", err)
+	}
 
-	// Force re-run: delete existing session
+	// Force re-run: delete every saved session for this document
 	if forceFlag {
-		hash, err := state.HashDoc(docPath)
-		if err == nil {
-			mgr := state.NewManager(workDir)
-			sessionDir := filepath.Join(mgr.BaseDir, hash)
-			if err := os.RemoveAll(sessionDir); err == nil {
-				fmt.Printf("Cleared session for %s\n", filepath.Base(docPath))
-			}
+		n, err := state.NewManager(workDir).DeleteByDocPath(docPath)
+		if err != nil {
+			return fmt.Errorf("clearing sessions: %w", err)
+		}
+		if n > 0 {
+			fmt.Printf("Cleared session for %s\n", filepath.Base(docPath))
 		}
 	}
 
-	systemPrompt := embeddedSystemPrompt()
+	systemPrompt := prompts.System
 	if systemFile != "" {
 		data, err := os.ReadFile(systemFile)
 		if err != nil {
@@ -228,6 +242,10 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	fmt.Println(paint(ansiBold, "tf-architect ") + paint(ansiDim, version))
 	fmt.Println(paint(ansiDim, strings.Repeat("─", 45)))
 
+	if !noMaskFlag {
+		orch.CustomSensitive = askCustomSensitive()
+	}
+
 	orch.OnStatus = func(msg string) {
 		fmt.Println(styleStatus(msg))
 	}
@@ -239,20 +257,98 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	orch.OnQuestion = func(questions []string) []string {
 		fmt.Println("\n" + paint(ansiCyan, "── Clarification needed ─────────────────────"))
 		answers := make([]string, len(questions))
-		reader := bufio.NewReader(os.Stdin)
 		for i, q := range questions {
 			fmt.Printf("\n%s %s\n%s ",
 				paint(ansiCyan, fmt.Sprintf("[%d/%d]", i+1, len(questions))),
 				paint(ansiBold, q),
 				paint(ansiCyan, ">"))
-			answer, _ := reader.ReadString('\n')
+			answer, _ := stdin.ReadString('\n')
 			answers[i] = strings.TrimSpace(answer)
 		}
 		fmt.Println(paint(ansiCyan, "─────────────────────────────────────────────"))
 		return answers
 	}
 
+	stop := handleInterrupt(orch.Interrupt)
+	defer stop()
 	return orch.Run(docPath)
+}
+
+const customDisclaimer = `Automatic masking covers ARNs, account IDs, IPs/CIDRs, AWS resource IDs,
+hostnames, emails, bucket names and common tag values. List anything else you
+consider sensitive (client or project names, internal codenames, ...). Values
+are masked wherever they appear, ignoring case.
+
+DISCLAIMER: values you do not list may be sent to Claude. The author of
+tf-architect accepts no responsibility for data exposed through omission or
+negligence when providing this list.`
+
+// askCustomSensitive asks for extra sensitive values as value1,value2,value3.
+// "null" (the default) or an empty answer means none. Non-interactive runs
+// get none.
+func askCustomSensitive() []string {
+	if !isTerminal(os.Stdin) {
+		fmt.Println(paint(ansiDim, "Custom sensitive values: none (non-interactive input)"))
+		return nil
+	}
+	fmt.Println("\n" + paint(ansiCyan, "── Custom sensitive values ──────────────────"))
+	fmt.Println(customDisclaimer)
+	fmt.Printf("\n%s %s ", paint(ansiBold, "Values (value1,value2,value3)"), paint(ansiDim, "[null]"))
+	line, _ := stdin.ReadString('\n')
+	values, short := parseCustomSensitive(line)
+	for _, v := range short {
+		fmt.Println(paint(ansiYellow, fmt.Sprintf("  ⚠ ignored %q: shorter than %d characters", v, masking.MinCustomLen)))
+	}
+	if len(values) == 0 {
+		fmt.Println(paint(ansiDim, "  No custom values."))
+	} else {
+		fmt.Println(paint(ansiGreen, fmt.Sprintf("  ✓ custom values to mask: %d", len(values))))
+	}
+	fmt.Println(paint(ansiCyan, "─────────────────────────────────────────────"))
+	return values
+}
+
+// parseCustomSensitive splits a comma-separated answer, dropping blanks and
+// "null". Values too short to mask safely are returned separately.
+func parseCustomSensitive(line string) (values, short []string) {
+	seen := make(map[string]bool)
+	for _, v := range strings.Split(line, ",") {
+		v = strings.TrimSpace(v)
+		if v == "" || strings.EqualFold(v, "null") || seen[v] {
+			continue
+		}
+		seen[v] = true
+		if len(v) < masking.MinCustomLen {
+			short = append(short, v)
+			continue
+		}
+		values = append(values, v)
+	}
+	return values, short
+}
+
+// handleInterrupt keeps the first Ctrl-C from killing the process outright:
+// onFirst stops further Claude calls, the running subprocess receives the
+// signal too and exits, so Run returns normally and de-masks the output
+// files. A second Ctrl-C exits immediately (files then stay masked until the
+// next run).
+func handleInterrupt(onFirst func()) (stop func()) {
+	ch := make(chan os.Signal, 2)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		if _, ok := <-ch; !ok {
+			return
+		}
+		onFirst()
+		fmt.Fprintln(os.Stderr, paint(ansiYellow, "\nInterrupt received — cleaning up (press Ctrl-C again to force quit)"))
+		if _, ok := <-ch; ok {
+			os.Exit(130)
+		}
+	}()
+	return func() {
+		signal.Stop(ch)
+		close(ch)
+	}
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
@@ -260,15 +356,12 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolving document path: %w", err)
 	}
-	workDir, _ := os.Getwd()
-
-	hash, err := state.HashDoc(docPath)
+	workDir, err := os.Getwd()
 	if err != nil {
-		return fmt.Errorf("hashing document: %w", err)
+		return err
 	}
 
-	mgr := state.NewManager(workDir)
-	sess, err := mgr.Load(hash)
+	sess, err := state.NewManager(workDir).FindByDocPath(docPath)
 	if err != nil {
 		return err
 	}
@@ -308,17 +401,18 @@ func runReset(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolving document path: %w", err)
 	}
-	workDir, _ := os.Getwd()
-
-	hash, err := state.HashDoc(docPath)
+	workDir, err := os.Getwd()
 	if err != nil {
-		return fmt.Errorf("hashing document: %w", err)
+		return err
 	}
 
-	mgr := state.NewManager(workDir)
-	sessionDir := filepath.Join(mgr.BaseDir, hash)
-	if err := os.RemoveAll(sessionDir); err != nil {
+	n, err := state.NewManager(workDir).DeleteByDocPath(docPath)
+	if err != nil {
 		return fmt.Errorf("deleting session: %w", err)
+	}
+	if n == 0 {
+		fmt.Printf("No session found for %s\n", filepath.Base(docPath))
+		return nil
 	}
 	fmt.Printf("Session for %s cleared.\n", filepath.Base(docPath))
 	return nil
@@ -340,13 +434,19 @@ func runValidate(cmd *cobra.Command, args []string) error {
 	passed, failed := 0, 0
 	for _, r := range results {
 		icon := paint(ansiGreen, "✓")
-		if !r.Passed {
+		switch {
+		case r.Skipped:
+			icon = paint(ansiDim, "–")
+		case !r.Passed:
 			icon = paint(ansiRed, "✗")
 			failed++
-		} else {
+		default:
 			passed++
 		}
 		fmt.Printf("  %s  %s\n", icon, r.Stage)
+		if r.Skipped {
+			fmt.Printf("       %s\n", paint(ansiDim, r.Output))
+		}
 		for _, e := range r.Errors {
 			fmt.Printf("       %s\n", paint(ansiRed, e))
 		}
@@ -359,35 +459,10 @@ func runValidate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	summary := fmt.Sprintf("\n%s, %s\n",
-		paint(ansiGreen, fmt.Sprintf("%d passed", passed)),
-		paint(ansiRed, fmt.Sprintf("%d failed", failed)))
-	if failed == 0 {
-		summary = fmt.Sprintf("\n%s\n", paint(ansiGreen, fmt.Sprintf("%d passed, 0 failed", passed)))
+	failedText := fmt.Sprintf("%d failed", failed)
+	if failed > 0 {
+		failedText = paint(ansiRed, failedText)
 	}
-	fmt.Print(summary)
-	if runErr != nil {
-		return runErr
-	}
-	return nil
-}
-
-// embeddedSystemPrompt reads the system prompt from the prompts/ directory
-// relative to the binary location, falling back to a minimal inline version.
-func embeddedSystemPrompt() string {
-	// Try relative to working directory first (dev mode)
-	candidates := []string{
-		"prompts/system.md",
-		filepath.Join(filepath.Dir(os.Args[0]), "prompts/system.md"),
-	}
-	for _, path := range candidates {
-		if data, err := os.ReadFile(path); err == nil {
-			return string(data)
-		}
-	}
-	// Minimal fallback — golden rules inline
-	return `You are an expert AWS infrastructure engineer generating production-grade Terraform IaC.
-Always configure S3 backend, pin provider versions, use default_tags, encrypt all storage,
-never use 0.0.0.0/0 ingress, use least-privilege IAM, never hardcode secrets.
-After each module write: STEP_COMPLETE:<module_name>`
+	fmt.Printf("\n%s, %s\n", paint(ansiGreen, fmt.Sprintf("%d passed", passed)), failedText)
+	return runErr
 }

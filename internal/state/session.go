@@ -19,7 +19,6 @@ const (
 	PhaseValidate Phase = "validate"
 	PhaseDocument Phase = "document"
 	PhaseDone     Phase = "done"
-	PhaseFailed   Phase = "failed"
 )
 
 var phaseOrder = map[Phase]int{
@@ -30,7 +29,6 @@ var phaseOrder = map[Phase]int{
 	PhaseValidate: 4,
 	PhaseDocument: 5,
 	PhaseDone:     6,
-	PhaseFailed:   -1,
 }
 
 func (p Phase) Before(other Phase) bool {
@@ -69,8 +67,6 @@ type Session struct {
 
 	CurrentPhase   Phase      `json:"current_phase"`
 	LastCheckpoint Checkpoint `json:"last_checkpoint"`
-
-	ClaudeSessionID string `json:"claude_session_id,omitempty"`
 
 	DocMarkdown    string               `json:"doc_markdown"`
 	AnalysisJSON   string               `json:"analysis_json"`
@@ -161,6 +157,33 @@ func (m *Manager) FindByDocPath(docPath string) (*Session, error) {
 		}
 	}
 	return latest, nil
+}
+
+// DeleteByDocPath removes every session recorded for docPath, including
+// sessions of earlier versions of the document. Returns how many were removed.
+func (m *Manager) DeleteByDocPath(docPath string) (int, error) {
+	entries, err := os.ReadDir(m.BaseDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		s, err := m.Load(entry.Name())
+		if err != nil || s == nil || s.DocPath != docPath {
+			continue
+		}
+		if err := os.RemoveAll(m.sessionDir(entry.Name())); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
 }
 
 // HashDoc returns the SHA256 hex digest of the file at path.

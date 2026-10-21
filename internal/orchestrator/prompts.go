@@ -12,6 +12,8 @@ type AnalysisResult struct {
 	Missing         []string `json:"missing"`
 	Inconsistencies []string `json:"inconsistencies"`
 	Summary         string   `json:"summary"`
+	// ParseFailed is set when the response was not valid JSON.
+	ParseFailed bool `json:"-"`
 }
 
 // BuildAnalysisPrompt returns the prompt sent to Claude for the initial analysis phase.
@@ -61,8 +63,9 @@ func ParseAnalysisJSON(raw string) AnalysisResult {
 	var result AnalysisResult
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
 		return AnalysisResult{
-			Ready:   false,
-			Missing: []string{"Unable to parse architecture analysis — Claude response was not valid JSON"},
+			Ready:       false,
+			Missing:     []string{"Unable to parse architecture analysis — Claude response was not valid JSON"},
+			ParseFailed: true,
 		}
 	}
 	return result

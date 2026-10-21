@@ -10,6 +10,9 @@ type maskRule struct {
 	prefixGroup  int
 	suffixGroup  int
 	skipPrefixes []string
+	// skipValues are well-known non-sensitive matches (the "anywhere"
+	// address must stay visible so ingress rules can be reviewed).
+	skipValues []string
 }
 
 var patterns = []maskRule{
@@ -34,9 +37,10 @@ var patterns = []maskRule{
 		format:   "%s",
 	},
 	{
-		re:       regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}\b`),
-		category: "CIDR_PUBLIC",
-		format:   "%s",
+		re:         regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}\b`),
+		category:   "CIDR_PUBLIC",
+		format:     "%s",
+		skipValues: []string{"0.0.0.0/0"},
 	},
 	{
 		re:       regexp.MustCompile(`\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b`),
@@ -44,9 +48,10 @@ var patterns = []maskRule{
 		format:   "%s",
 	},
 	{
-		re:       regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`),
-		category: "IP_PUBLIC",
-		format:   "%s",
+		re:         regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`),
+		category:   "IP_PUBLIC",
+		format:     "%s",
+		skipValues: []string{"0.0.0.0"},
 	},
 	{
 		re:       regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`),

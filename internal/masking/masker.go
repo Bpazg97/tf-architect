@@ -1,6 +1,7 @@
 package masking
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,99 +10,170 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"tf-architect/internal/fsutil"
 )
 
 // MaskMap maps placeholder → real value.
 // Persisted as mask.json alongside session.json.
 type MaskMap map[string]string
 
-// maskedSuffixes are the generated-file extensions that may contain
-// placeholders (Terraform code, tfvars, and Claude-written docs).
-var maskedSuffixes = []string{".tf", ".tfvars", ".md"}
+// placeholderRe matches any placeholder token produced by makePlaceholder.
+var placeholderRe = regexp.MustCompile(`[A-Z]+(?:_[A-Z]+)*_\d{3,}`)
 
 // Mask replaces sensitive values in text with stable placeholders.
-// Pass an existing MaskMap to reuse placeholders on resume/doc-changed runs.
+// Values already in existing are replaced first (even without the context a
+// pattern needs, e.g. a tag value quoted in a tool error), then the
+// patterns run. Text that is already masked is left unchanged.
 // Pass nil for a fresh run. Returns masked text and complete (merged) MaskMap.
 func Mask(text string, existing MaskMap) (string, MaskMap, error) {
 	s := newMaskState(existing)
-	result := text
+	result := s.replaceCustom(text)
+	result = s.replaceKnown(result)
 	for i := range patterns {
 		result = patterns[i].apply(result, s)
 	}
 	return result, s.mm, nil
 }
 
-// Unmask walks all masked-suffix files in dir and replaces placeholders with
-// real values in-place. If a file cannot be read or written, a warning is
-// appended but processing continues.
-func Unmask(dir string, mm MaskMap) error {
+// customCategory marks values the user declared sensitive. They are masked
+// wherever they appear, ignoring case and word boundaries.
+const customCategory = "CUSTOM"
+
+// MinCustomLen is the shortest accepted custom value: shorter ones would
+// mask fragments of almost every word.
+const MinCustomLen = 3
+
+// AddCustom returns mm extended with a placeholder for each user-declared
+// sensitive value. Values shorter than MinCustomLen are ignored.
+func AddCustom(mm MaskMap, values []string) MaskMap {
+	s := newMaskState(mm)
+	for _, v := range values {
+		if len(v) >= MinCustomLen {
+			s.makePlaceholder(customCategory, "%s", v)
+		}
+	}
+	return s.mm
+}
+
+// replaceCustom masks every case variant of the custom values ("Phoenix",
+// "phoenix-api", "PHOENIX") that is not inside an existing placeholder.
+func (s *maskState) replaceCustom(text string) string {
+	var customs []string
+	for ph, real := range s.mm {
+		if cat, _ := parsePlaceholder(ph); cat == customCategory {
+			customs = append(customs, real)
+		}
+	}
+	sort.Slice(customs, func(i, j int) bool { return len(customs[i]) > len(customs[j]) })
+	for _, v := range customs {
+		re := regexp.MustCompile(`(?i)` + regexp.QuoteMeta(v))
+		spans := placeholderRe.FindAllStringIndex(text, -1)
+		var sb strings.Builder
+		last := 0
+		for _, m := range re.FindAllStringIndex(text, -1) {
+			if overlapsAny(spans, m[0], m[1]) {
+				continue
+			}
+			sb.WriteString(text[last:m[0]])
+			sb.WriteString(s.makePlaceholder(customCategory, "%s", text[m[0]:m[1]]))
+			last = m[1]
+		}
+		sb.WriteString(text[last:])
+		text = sb.String()
+	}
+	return text
+}
+
+// UnmaskText replaces placeholders in text with their real values.
+func UnmaskText(text string, mm MaskMap) string {
 	// Longer placeholders first: FOO_100 must not corrupt FOO_1000.
-	pairs := sortedPairs(mm, func(ph, real string) (string, string) { return ph, real })
-	return replaceInDir(dir, pairs)
-}
-
-// MaskDir is the inverse of Unmask: replaces known real values with their
-// placeholders in all masked-suffix files. Used before handing existing
-// (already de-masked) files to Claude for edits or auto-fix.
-func MaskDir(dir string, mm MaskMap) error {
-	// Longer values first: an account ID inside an ARN must not split the ARN.
-	pairs := sortedPairs(mm, func(ph, real string) (string, string) { return real, ph })
-	return replaceInDir(dir, pairs)
-}
-
-func sortedPairs(mm MaskMap, order func(ph, real string) (from, to string)) [][2]string {
 	pairs := make([][2]string, 0, len(mm))
 	for ph, real := range mm {
-		from, to := order(ph, real)
-		pairs = append(pairs, [2]string{from, to})
+		pairs = append(pairs, [2]string{ph, real})
 	}
 	sort.Slice(pairs, func(i, j int) bool { return len(pairs[i][0]) > len(pairs[j][0]) })
-	return pairs
+
+	// A real value may itself contain a placeholder (an ARN masked after its
+	// account ID was): repeat until stable. Each pass resolves one level.
+	for i := 0; i <= len(pairs); i++ {
+		next := text
+		for _, p := range pairs {
+			next = replacePlaceholder(next, p[0], p[1])
+		}
+		if next == text {
+			break
+		}
+		text = next
+	}
+	return text
 }
 
-func hasMaskedSuffix(path string) bool {
-	for _, suf := range maskedSuffixes {
-		if strings.HasSuffix(path, suf) {
-			return true
-		}
-	}
-	return false
+// Unmask replaces placeholders with real values in-place in every text file
+// under dir. Unreadable or unwritable files are reported in the error but do
+// not stop processing.
+func Unmask(dir string, mm MaskMap) error {
+	return rewriteDir(dir, func(content string) string { return UnmaskText(content, mm) })
 }
 
-func replaceInDir(dir string, pairs [][2]string) error {
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return nil
-	}
-	var warnings []string
-	walkErr := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !hasMaskedSuffix(path) {
-			return err
-		}
+// MaskDir is the inverse of Unmask: it masks every text file under dir with
+// Mask, so both known real values and newly discovered sensitive values are
+// replaced. Used before Claude can read the directory. Returns the merged
+// MaskMap; any error means some file may still hold real values.
+func MaskDir(dir string, mm MaskMap) (MaskMap, error) {
+	err := rewriteDir(dir, func(content string) string {
+		masked, merged, _ := Mask(content, mm)
+		mm = merged
+		return masked
+	})
+	return mm, err
+}
+
+// rewriteDir applies fn to every text file under dir, writing only files
+// whose content changed.
+func rewriteDir(dir string, fn func(string) string) error {
+	var problems []string
+	walkErr := fsutil.WalkFiles(dir, func(path string, info os.FileInfo) error {
 		data, readErr := os.ReadFile(path)
 		if readErr != nil {
-			warnings = append(warnings, fmt.Sprintf("%s: read: %v", path, readErr))
+			problems = append(problems, fmt.Sprintf("%s: read: %v", path, readErr))
 			return nil
 		}
-		content := string(data)
-		for _, p := range pairs {
-			content = strings.ReplaceAll(content, p[0], p[1])
+		if isBinary(data) {
+			return nil
+		}
+		content := fn(string(data))
+		if content == string(data) {
+			return nil
 		}
 		if writeErr := os.WriteFile(path, []byte(content), info.Mode()); writeErr != nil {
-			warnings = append(warnings, fmt.Sprintf("%s: write: %v", path, writeErr))
+			problems = append(problems, fmt.Sprintf("%s: write: %v", path, writeErr))
 		}
 		return nil
 	})
 	if walkErr != nil {
 		return walkErr
 	}
-	if len(warnings) > 0 {
-		return fmt.Errorf("unmask partial: %s", strings.Join(warnings, "; "))
+	if len(problems) > 0 {
+		return fmt.Errorf("rewrite partial: %s", strings.Join(problems, "; "))
 	}
 	return nil
 }
 
+// isBinary reports whether data looks like a binary file (NUL in the head).
+func isBinary(data []byte) bool {
+	head := data
+	if len(head) > 8000 {
+		head = head[:8000]
+	}
+	return bytes.IndexByte(head, 0) >= 0
+}
+
 // SaveMaskMap writes mm to path as JSON with 0600 permissions.
 func SaveMaskMap(path string, mm MaskMap) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(mm, "", "  ")
 	if err != nil {
 		return err
@@ -142,7 +214,98 @@ func newMaskState(existing MaskMap) *maskState {
 	return s
 }
 
+// replaceKnown replaces every known real value in text with its placeholder.
+// Longer values first: an account ID inside an ARN must not split the ARN.
+func (s *maskState) replaceKnown(text string) string {
+	reals := make([]string, 0, len(s.realToPlaceholder))
+	for real := range s.realToPlaceholder {
+		if real != "" {
+			reals = append(reals, real)
+		}
+	}
+	sort.Slice(reals, func(i, j int) bool { return len(reals[i]) > len(reals[j]) })
+	for _, real := range reals {
+		text = replaceBounded(text, real, s.realToPlaceholder[real])
+	}
+	return text
+}
+
+// replaceBounded replaces occurrences of from that are not part of a longer
+// alphanumeric token ("dev" must not hit "device", "10.0.0.1" must not hit
+// "10.0.0.15") and that do not fall inside an existing placeholder.
+func replaceBounded(text, from, to string) string {
+	if !strings.Contains(text, from) {
+		return text
+	}
+	spans := placeholderRe.FindAllStringIndex(text, -1)
+	var sb strings.Builder
+	i := 0
+	for {
+		j := strings.Index(text[i:], from)
+		if j < 0 {
+			break
+		}
+		start, end := i+j, i+j+len(from)
+		if !isAlnumAt(text, start-1) && !isAlnumAt(text, end) && !overlapsAny(spans, start, end) {
+			sb.WriteString(text[i:start])
+			sb.WriteString(to)
+			i = end
+		} else {
+			sb.WriteString(text[i : start+1])
+			i = start + 1
+		}
+	}
+	sb.WriteString(text[i:])
+	return sb.String()
+}
+
+// replacePlaceholder replaces ph unless it is followed by a digit
+// (ACCOUNT_100 inside ACCOUNT_1000).
+func replacePlaceholder(text, ph, real string) string {
+	if !strings.Contains(text, ph) {
+		return text
+	}
+	var sb strings.Builder
+	i := 0
+	for {
+		j := strings.Index(text[i:], ph)
+		if j < 0 {
+			break
+		}
+		start, end := i+j, i+j+len(ph)
+		sb.WriteString(text[i:start])
+		if end < len(text) && text[end] >= '0' && text[end] <= '9' {
+			sb.WriteString(ph)
+		} else {
+			sb.WriteString(real)
+		}
+		i = end
+	}
+	sb.WriteString(text[i:])
+	return sb.String()
+}
+
+func isAlnumAt(text string, i int) bool {
+	if i < 0 || i >= len(text) {
+		return false
+	}
+	c := text[i]
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
+func overlapsAny(spans [][]int, start, end int) bool {
+	for _, sp := range spans {
+		if start < sp[1] && end > sp[0] {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *maskState) makePlaceholder(category, format, value string) string {
+	if _, isPlaceholder := s.mm[value]; isPlaceholder {
+		return value
+	}
 	if ph, ok := s.realToPlaceholder[value]; ok {
 		return ph
 	}
@@ -176,6 +339,11 @@ func (rule *maskRule) apply(text string, s *maskState) string {
 					return match
 				}
 			}
+			for _, v := range rule.skipValues {
+				if match == v {
+					return match
+				}
+			}
 			return s.makePlaceholder(rule.category, rule.format, match)
 		})
 	}
@@ -186,6 +354,10 @@ func (rule *maskRule) apply(text string, s *maskState) string {
 			return match
 		}
 		value := subs[rule.valueGroup]
+		// Terraform interpolations are code, not data.
+		if strings.Contains(value, "${") {
+			return match
+		}
 		placeholder := s.makePlaceholder(rule.category, rule.format, value)
 		prefix, suffix := "", ""
 		if rule.prefixGroup > 0 && len(subs) > rule.prefixGroup {

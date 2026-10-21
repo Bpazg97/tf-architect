@@ -6,13 +6,16 @@ Generate and validate production-grade AWS Terraform IaC from architecture docum
 
 Feed `tf-architect` a PDF, DOCX, Markdown, or text document describing your AWS architecture and it will:
 
-1. **Mask sensitive values** — ARNs, IPs, account IDs, hostnames, tag values, and emails are replaced with stable placeholders before any text reaches Claude
-2. Analyse the masked document with Claude
-3. Ask clarifying questions if information is missing (answers are masked too)
-4. Generate production-grade Terraform modules (with placeholders)
-5. Validate the output with `terraform`, `tflint`, `checkov`, and a golden-rules audit — files stay masked through validation, AI auto-fix, and documentation, so Claude never reads real values from disk
-6. Produce `terraform-docs` documentation
-7. **Restore real values** — generated `.tf`, `.tfvars`, and `.md` files are de-masked once, after the last AI call
+1. **Ask for custom sensitive values** — optional comma-separated list (`value1,value2,value3`, default `null`) of names the patterns cannot know about
+2. **Mask sensitive values** — ARNs, IPs, account IDs, hostnames, tag values, emails and your custom values are replaced with stable placeholders before any text reaches Claude
+3. Analyse the masked document with Claude
+4. Ask clarifying questions if information is missing (answers are masked too)
+5. Generate production-grade Terraform modules (with placeholders). Claude only writes and reviews code: it has no shell and never runs `terraform` or anything else
+6. Run best-effort checks locally (`terraform init/validate`, `tflint`, `checkov`, golden-rules audit — each skipped if not installed) on a de-masked temporary copy, with one AI auto-fix pass
+7. Produce architectural and `terraform-docs` documentation — also when issues remain
+8. **Restore real values** — every text file in the output directory is de-masked once, after the last AI call
+
+> **You are responsible for the result.** tf-architect generates a starting point. Review, validate and test the code before using it. Remaining check failures are listed at the end and make the command exit non-zero.
 
 Sessions are persisted — interrupted runs resume from the last checkpoint.
 
@@ -21,10 +24,11 @@ Sessions are persisted — interrupted runs resume from the last checkpoint.
 **Required**
 
 - Go 1.26+
-- [Terraform](https://developer.hashicorp.com/terraform/install)
-- Claude CLI (`claude` in `$PATH`)
+- Claude CLI (`claude` in `$PATH`) with `ANTHROPIC_API_KEY` set — it runs in `--bare` mode, which never reads `claude login` credentials
 
 **Optional (validation)**
+
+- [Terraform](https://developer.hashicorp.com/terraform/install) — `init`/`validate` are skipped without it
 
 - `tflint` — HCL linting
 - `checkov` — security/compliance scan
@@ -95,11 +99,23 @@ By default, tf-architect automatically masks sensitive infrastructure values bef
 | Tag value | `owner = "acme-corp"` | `TAG_VALUE_001` |
 | Email | `ops@company.com` | `EMAIL_001` |
 
+| Custom value | `Phoenix` (also `phoenix-api`, `PHOENIX`) | `CUSTOM_001` |
+
+**Custom values:** at the start of `run` you are asked for extra sensitive values as `value1,value2,value3`. Press Enter (or type `null`) for none. They are masked wherever they appear, ignoring case. Values shorter than 3 characters are ignored, and values cannot contain commas. Non-interactive runs (stdin not a terminal) skip the question.
+
+> **Disclaimer:** automatic masking only covers the patterns above. Anything else you do not list may be sent to Claude. The author of tf-architect accepts no responsibility for data exposed through omission or negligence.
+
 Placeholders are stable — the same value always gets the same placeholder across the entire document. The mapping is stored in `.tf-architect/sessions/<hash>/mask.json` (mode `0600`).
 
-**Security invariant:** everything sent to Claude is masked — the document, clarification answers you type, validation errors, and resume context. Files on disk stay masked while Claude can read them (generation, auto-fix, documentation). De-masking of `.tf`, `.tfvars`, and `.md` files happens exactly once, after the last AI call. When a `run` re-edits previously de-masked files (document changed, or auto-fix on a completed session), they are re-masked first.
+**Security invariant:** nothing sensitive reaches Claude.
 
-**Residual risk:** the Claude subprocess runs with `Bash` enabled (needed for `terraform` commands); masking protects content, not the execution environment. Audit `prompts/system.md` and run in an isolated workspace for strict environments.
+- Every prompt and the system prompt pass through the masker inside the Claude client — a single choke point that fails closed (if masking or saving `mask.json` fails, nothing is sent).
+- Every text file in the output directory is masked before the first AI call of each run (including files you edited by hand) and de-masked exactly once when the run ends, on success or error.
+- Validators need real values, so they run on a de-masked temporary copy; their errors are masked before being stored or sent.
+
+**Confinement:** Claude runs with `--restricted` and only the file tools (`Read, Write, Edit, Glob, Grep`), with the output directory as its working directory. It has no shell and cannot read outside that directory, so the source document and `.tf-architect/` (which holds `mask.json`) are out of reach. `run` refuses an output directory that contains either of them.
+
+**Interrupts:** the first Ctrl-C lets the run finish cleanup and de-mask the files. A second Ctrl-C quits immediately; files then stay masked until the next `run` restores them.
 
 ### Validate a Terraform directory
 
@@ -113,8 +129,8 @@ Checks (in order):
 
 | # | Check | Required |
 |---|-------|----------|
-| 1 | `terraform init` | yes |
-| 2 | `terraform validate` | yes |
+| 1 | `terraform init` | if installed |
+| 2 | `terraform validate` | if installed |
 | 3 | `tflint` | if installed |
 | 4 | `checkov` | if installed |
 | 5 | Golden-rules audit | always |

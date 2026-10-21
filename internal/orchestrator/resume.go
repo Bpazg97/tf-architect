@@ -23,10 +23,14 @@ type ResumeDecision struct {
 	Mode        ResumeMode
 	Session     *state.Session
 	ContextBlob string
+	// PrevMaskMap is the previous version's mask map (ModeDocChanged only):
+	// reusing it keeps placeholders stable across document versions.
+	PrevMaskMap masking.MaskMap
 }
 
 // DecideResume analyses persisted state and determines how to proceed.
-func DecideResume(docPath string, mgr *state.Manager) (*ResumeDecision, error) {
+// custom are user-declared sensitive values; they mask the document diff.
+func DecideResume(docPath string, mgr *state.Manager, custom ...string) (*ResumeDecision, error) {
 	currentHash, err := state.HashDoc(docPath)
 	if err != nil {
 		return nil, fmt.Errorf("hashing document: %w", err)
@@ -74,9 +78,13 @@ func DecideResume(docPath string, mgr *state.Manager) (*ResumeDecision, error) {
 	// sensitive value reports as changed AND raw values leak into DiffSummary.
 	var prevMM masking.MaskMap
 	if prev.MaskMapPath != "" {
-		if mm, loadErr := masking.LoadMaskMap(prev.MaskMapPath); loadErr == nil {
-			prevMM = mm
+		// Fail closed: without the map the diff would carry raw values.
+		if prevMM, err = masking.LoadMaskMap(prev.MaskMapPath); err != nil {
+			return nil, fmt.Errorf("loading previous mask map: %w", err)
 		}
+	}
+	if len(custom) > 0 {
+		prevMM = masking.AddCustom(prevMM, custom)
 	}
 	diffSummary := computeMarkdownDiff(prev.DocMarkdown, docPath, prevMM)
 	newSession := &state.Session{
@@ -88,10 +96,14 @@ func DecideResume(docPath string, mgr *state.Manager) (*ResumeDecision, error) {
 		DiffSummary:     diffSummary,
 		GeneratedFiles:  prev.GeneratedFiles,
 	}
+	// The previous run's context, plus the diff it must now apply.
+	view := *prev
+	view.DiffSummary = diffSummary
 	return &ResumeDecision{
 		Mode:        ModeDocChanged,
 		Session:     newSession,
-		ContextBlob: buildContextBlobForDocChange(prev, diffSummary),
+		ContextBlob: buildContextBlob(&view),
+		PrevMaskMap: prevMM,
 	}, nil
 }
 
@@ -149,17 +161,18 @@ func buildContextBlob(s *state.Session) string {
 		}
 	}
 
-	return sb.String()
-}
+	// Kept on resumed doc-changed sessions so an interrupted run still knows
+	// it must adjust the existing files rather than regenerate them.
+	if s.DiffSummary != "" {
+		sb.WriteString(fmt.Sprintf(
+			"\n## DOCUMENT CHANGED\n\nDiff summary:\n%s\n\n"+
+				"INSTRUCTION: Do NOT regenerate from scratch. Only adjust existing "+
+				"Terraform files to reflect the changes above. Preserve unchanged resources.\n",
+			s.DiffSummary,
+		))
+	}
 
-func buildContextBlobForDocChange(prev *state.Session, diffSummary string) string {
-	base := buildContextBlob(prev)
-	return base + fmt.Sprintf(
-		"\n## DOCUMENT CHANGED\n\nDiff summary:\n%s\n\n"+
-			"INSTRUCTION: Do NOT regenerate from scratch. Only adjust existing "+
-			"Terraform files to reflect the changes above. Preserve unchanged resources.\n",
-		diffSummary,
-	)
+	return sb.String()
 }
 
 func computeMarkdownDiff(prevMarkdown, newDocPath string, prevMM masking.MaskMap) string {
