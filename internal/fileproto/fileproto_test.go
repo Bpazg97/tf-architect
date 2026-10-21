@@ -74,7 +74,7 @@ func TestParseDuplicatePathLastWins(t *testing.T) {
 }
 
 func TestValidatePathRejects(t *testing.T) {
-	for _, p := range []string{"/etc/x.tf", "../x.tf", "a/../../x.tf", ".terraform/m.tf", ".git/config.tf", ".tf-architect/s.json", "x.exe", ""} {
+	for _, p := range []string{"/etc/x.tf", "../x.tf", "a/../../x.tf", ".terraform/m.tf", ".git/config.tf", ".Git/config.tf", ".GIT/x.tf", ".Terraform/x.tf", "a/.TF-Architect/s.json", ".tf-architect/s.json", "x.exe", ""} {
 		err := ValidatePath(p)
 		var se *security.Error
 		if !errors.As(err, &se) {
@@ -150,5 +150,35 @@ func TestRenderRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, m) {
 		t.Fatalf("got %v", got)
+	}
+}
+
+func TestApplyRefusesSymlinks(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	target := filepath.Join(outside, "victim.tf")
+	if err := os.WriteFile(target, []byte("orig"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "link")); err != nil {
+		t.Skip("symlinks unsupported")
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "main.tf")); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"link/new.tf", "link/victim.tf", "main.tf"} {
+		err := Apply(dir, []Change{{Path: p, Content: "pwn"}}, nil)
+		var se *security.Error
+		if !errors.As(err, &se) {
+			t.Errorf("%s: want *security.Error, got %v", p, err)
+		}
+	}
+	if err := Apply(dir, []Change{{Path: "main.tf", Delete: true}}, nil); err == nil {
+		t.Error("delete through symlink accepted")
+	}
+	if b, _ := os.ReadFile(target); string(b) != "orig" {
+		t.Fatalf("outside file modified: %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "new.tf")); !os.IsNotExist(err) {
+		t.Fatal("file created outside project")
 	}
 }

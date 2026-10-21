@@ -130,7 +130,7 @@ func ValidatePath(p string) error {
 	}
 	// Check raw segments: Clean would silently resolve "a/../b".
 	for _, seg := range strings.Split(norm, "/") {
-		if forbiddenSegments[seg] {
+		if forbiddenSegments[strings.ToLower(seg)] {
 			return unsafe(fmt.Sprintf("The path segment %q is not allowed.", seg))
 		}
 	}
@@ -147,6 +147,9 @@ func ValidatePath(p string) error {
 func Apply(dir string, changes []Change, transform func(string) string) error {
 	for _, c := range changes {
 		if err := ValidatePath(c.Path); err != nil {
+			return err
+		}
+		if err := refuseSymlinks(dir, c.Path); err != nil {
 			return err
 		}
 	}
@@ -167,6 +170,30 @@ func Apply(dir string, changes []Change, transform func(string) string) error {
 		}
 		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// refuseSymlinks fails if any existing component of p under dir is a symlink,
+// since writing through one could escape the project directory.
+func refuseSymlinks(dir, p string) error {
+	cur := dir
+	for _, seg := range strings.Split(cleanPath(p), "/") {
+		cur = filepath.Join(cur, seg)
+		fi, err := os.Lstat(cur)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return security.New(
+				fmt.Sprintf("The AI chose a path that goes through a symbolic link: %q.", p),
+				"Writing through a symlink could modify files outside your project.",
+				"Remove the symlink from the project directory, then re-run the command.",
+			)
 		}
 	}
 	return nil
