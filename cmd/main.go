@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"tf-architect/internal/llm"
 	"tf-architect/internal/masking"
 	"tf-architect/internal/orchestrator"
+	"tf-architect/internal/security"
 	"tf-architect/internal/state"
 	"tf-architect/internal/validation"
 	"tf-architect/prompts"
@@ -21,9 +24,15 @@ import (
 var (
 	outputDir  string
 	forceFlag  bool
-	systemFile string
+	agentsFile string
 	noMaskFlag bool
 	version    = "dev"
+
+	providerFlag  string
+	modelFlag     string
+	baseURLFlag   string
+	yesCustomFlag bool
+	claudeBin     string // test hook: path of the claude binary
 )
 
 // ── TUI styling ──────────────────────────────────────────────────────────────
@@ -79,9 +88,11 @@ func main() {
 	root := &cobra.Command{
 		Use:     "tf-architect",
 		Version: version,
-		// Runtime errors are not usage errors: print the error only.
-		SilenceUsage: true,
-		Short:        "Generate and validate production Terraform IaC from architecture documents",
+		// Runtime errors are not usage errors; main prints them itself
+		// (security stops as a pop-up), so cobra must not print them too.
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Short:         "Generate and validate production Terraform IaC from architecture documents",
 		Long: `tf-architect turns architecture documents (PDF, DOCX, MD, TXT) into
 production-grade AWS Terraform — and validates existing Terraform projects.
 
@@ -115,9 +126,16 @@ Sessions are persisted: interrupted runs resume from the last checkpoint.`,
 		Short: "Generate Terraform IaC from an architecture document",
 		Long: `Reads an architecture document and generates production-grade AWS Terraform.
 
-Claude analyses the document, asks clarifying questions when information is
-missing, then generates each Terraform module. After generation it runs the
-full validation suite and produces terraform-docs documentation.
+The AI model analyses the document, asks clarifying questions when information
+is missing, then generates each Terraform module. After generation it runs the
+best-effort validation suite and produces documentation. Sensitive values are
+masked before anything is sent to the provider.
+
+Providers (--provider): claude (default, uses your Claude Code login),
+anthropic, openai, gemini, openai-compatible. API keys come only from the
+environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, TFA_API_KEY.
+
+Exit codes: 0 ok, 1 error, 2 security stop (nothing sensitive was sent).
 
 Supported formats: PDF, DOCX, MD, TXT`,
 		Example: `  # Generate into the default output directory (<docname>-tf/)
@@ -129,14 +147,25 @@ Supported formats: PDF, DOCX, MD, TXT`,
   # Force a full re-run (discard saved session)
   tf-architect run architecture.pdf --force
 
-  # Use a custom system prompt / golden rules file
-  tf-architect run architecture.pdf --system-file ./my-rules.md`,
+  # Use a custom agents prompt / golden rules file
+  tf-architect run architecture.pdf --agents-file ./my-rules.md
+
+  # Use another provider
+  OPENAI_API_KEY=... tf-architect run architecture.pdf --provider openai --model <model>
+
+  # Self-hosted OpenAI-compatible endpoint
+  TFA_API_KEY=... tf-architect run architecture.pdf --provider openai-compatible \
+      --base-url https://llm.internal.example/v1 --model <model>`,
 		Args: cobra.ExactArgs(1),
 		RunE: runGenerate,
 	}
 	runCmd.Flags().StringVarP(&outputDir, "output", "o", "", "Output directory for Terraform files (default: <docname>-tf/)")
 	runCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force full re-run, ignoring saved session state")
-	runCmd.Flags().StringVar(&systemFile, "system-file", "", "Path to custom system prompt file (default: built-in golden rules)")
+	runCmd.Flags().StringVar(&agentsFile, "agents-file", "", "Path to custom agents prompt file (default: built-in golden rules)")
+	runCmd.Flags().StringVar(&providerFlag, "provider", "claude", "AI provider: claude, anthropic, openai, gemini, openai-compatible")
+	runCmd.Flags().StringVar(&modelFlag, "model", "", "Model name (required for openai, gemini and openai-compatible)")
+	runCmd.Flags().StringVar(&baseURLFlag, "base-url", "", "Override the provider endpoint (HTTPS, or http on localhost); required for openai-compatible")
+	runCmd.Flags().BoolVar(&yesCustomFlag, "yes-custom-endpoint", false, "Accept a non-local --base-url without asking (for non-interactive runs)")
 	runCmd.Flags().BoolVar(&noMaskFlag, "no-mask", false, "Disable sensitive value masking (debug only — never use in production)")
 
 	statusCmd := &cobra.Command{
@@ -190,9 +219,58 @@ The command exits with a non-zero status if any check fails.`,
 	}
 
 	root.AddCommand(runCmd, statusCmd, resetCmd, validateCmd)
-	if err := root.Execute(); err != nil {
-		os.Exit(1)
+	os.Exit(reportError(os.Stderr, root.Execute()))
+}
+
+// reportError prints err and returns the process exit code: a security stop
+// (anywhere in the chain) is shown as a pop-up and exits 2, any other error
+// prints its message and exits 1.
+func reportError(w io.Writer, err error) int {
+	if err == nil {
+		return 0
 	}
+	var se *security.Error
+	if errors.As(err, &se) {
+		fmt.Fprint(w, renderPopup(se))
+		return 2
+	}
+	fmt.Fprintln(w, "Error: "+err.Error())
+	return 1
+}
+
+// confirmCustomEndpoint makes sure a non-local --base-url is a conscious
+// choice before any provider call: prompts are sent there. Without the flag
+// and without a terminal to ask on, it stops.
+func confirmCustomEndpoint(baseURL string, yes, interactive bool, in *bufio.Reader, out io.Writer) error {
+	if baseURL == "" {
+		return nil
+	}
+	local, err := llm.IsLocalURL(baseURL)
+	if err != nil {
+		return fmt.Errorf("--base-url: %w", err)
+	}
+	if local || yes {
+		return nil
+	}
+	stop := func(what string) error {
+		return security.New(what,
+			"A custom endpoint receives your masked prompts and API key; sending them to an unintended host would expose them.",
+			"Check the URL, then re-run with --yes-custom-endpoint (or answer y when asked) to trust it.")
+	}
+	if !interactive {
+		return stop("Custom endpoint " + baseURL + " was not confirmed (non-interactive run).")
+	}
+	fmt.Fprintln(out, paint(ansiYellow, "┌─ Custom endpoint ─────────────────────────────────────────"))
+	fmt.Fprintln(out, paint(ansiYellow, "│ ")+"Prompts and your API key will be sent to:")
+	fmt.Fprintln(out, paint(ansiYellow, "│ ")+paint(ansiBold, baseURL))
+	fmt.Fprintln(out, paint(ansiYellow, "└───────────────────────────────────────────────────────────"))
+	fmt.Fprint(out, "Continue? [y/N] ")
+	line, _ := in.ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return nil
+	}
+	return stop("Custom endpoint " + baseURL + " was declined.")
 }
 
 func runGenerate(cmd *cobra.Command, args []string) error {
@@ -229,16 +307,31 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	systemPrompt := prompts.Agents
-	if systemFile != "" {
-		data, err := os.ReadFile(systemFile)
+	agents := prompts.Agents
+	if agentsFile != "" {
+		data, err := os.ReadFile(agentsFile)
 		if err != nil {
-			return fmt.Errorf("reading system file: %w", err)
+			return fmt.Errorf("reading agents file: %w", err)
 		}
-		systemPrompt = string(data)
+		agents = string(data)
 	}
 
-	orch := orchestrator.New(workDir, outputDir, systemPrompt, &llm.ClaudeCLI{}, noMaskFlag)
+	// Endpoint confirmation and provider construction happen before any
+	// provider call.
+	if err := confirmCustomEndpoint(baseURLFlag, yesCustomFlag, isTerminal(os.Stdin), stdin, os.Stdout); err != nil {
+		return err
+	}
+	provider, err := llm.New(llm.Config{
+		Provider:  providerFlag,
+		Model:     modelFlag,
+		BaseURL:   baseURLFlag,
+		ClaudeBin: claudeBin,
+	})
+	if err != nil {
+		return err
+	}
+
+	orch := orchestrator.New(workDir, outputDir, agents, provider, noMaskFlag)
 
 	fmt.Println(paint(ansiBold, "tf-architect ") + paint(ansiDim, version))
 	fmt.Println(paint(ansiDim, strings.Repeat("─", 45)))
@@ -276,7 +369,7 @@ hostnames, emails, bucket names and common tag values. List anything else you
 consider sensitive (client or project names, internal codenames, ...). Values
 are masked wherever they appear, ignoring case.
 
-DISCLAIMER: values you do not list may be sent to Claude. The author of
+DISCLAIMER: values you do not list may be sent to the AI provider. The author of
 tf-architect accepts no responsibility for data exposed through omission or
 negligence when providing this list.`
 
