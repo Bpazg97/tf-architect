@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"tf-architect/internal/fileproto"
 	"tf-architect/internal/llm"
 	"tf-architect/internal/masking"
 	"tf-architect/internal/orchestrator"
@@ -41,8 +42,12 @@ var (
 var colorEnabled = os.Getenv("NO_COLOR") == "" && isTerminal(os.Stdout)
 
 // stdin is shared by every prompt: separate bufio readers on os.Stdin would
-// each buffer input the others never see.
-var stdin = bufio.NewReader(os.Stdin)
+// each buffer input the others never see. Tests replace it and
+// stdinIsTerminal so they never read the real stdin.
+var (
+	stdin           = bufio.NewReader(os.Stdin)
+	stdinIsTerminal = func() bool { return isTerminal(os.Stdin) }
+)
 
 func isTerminal(f *os.File) bool {
 	fi, err := f.Stat()
@@ -135,7 +140,8 @@ Providers (--provider): claude (default, uses your Claude Code login),
 anthropic, openai, gemini, openai-compatible. API keys come only from the
 environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, TFA_API_KEY.
 
-Exit codes: 0 ok, 1 error, 2 security stop (nothing sensitive was sent).
+Exit codes: 0 ok, 1 error, 2 security stop (nothing sensitive was sent),
+130 interrupted (state saved; re-run to resume).
 
 Supported formats: PDF, DOCX, MD, TXT`,
 		Example: `  # Generate into the default output directory (<docname>-tf/)
@@ -219,22 +225,26 @@ The command exits with a non-zero status if any check fails.`,
 	}
 
 	root.AddCommand(runCmd, statusCmd, resetCmd, validateCmd)
-	os.Exit(reportError(os.Stderr, root.Execute()))
+	err := root.Execute()
+	os.Exit(reportError(os.Stderr, err, noMaskFlag))
 }
 
 // reportError prints err and returns the process exit code: a security stop
-// (anywhere in the chain) is shown as a pop-up and exits 2, any other error
-// prints its message and exits 1.
-func reportError(w io.Writer, err error) int {
+// (anywhere in the chain) is shown as a pop-up and exits 2, a user interrupt
+// exits 130, any other error prints its message and exits 1.
+func reportError(w io.Writer, err error, noMask bool) int {
 	if err == nil {
 		return 0
 	}
 	var se *security.Error
 	if errors.As(err, &se) {
-		fmt.Fprint(w, renderPopup(se))
+		fmt.Fprint(w, renderPopup(se, noMask))
 		return 2
 	}
 	fmt.Fprintln(w, "Error: "+err.Error())
+	if errors.Is(err, orchestrator.ErrInterrupted) {
+		return 130
+	}
 	return 1
 }
 
@@ -245,9 +255,9 @@ func confirmCustomEndpoint(baseURL string, yes, interactive bool, in *bufio.Read
 	if baseURL == "" {
 		return nil
 	}
-	local, err := llm.IsLocalURL(baseURL)
+	local, err := llm.CheckBaseURL(baseURL)
 	if err != nil {
-		return fmt.Errorf("--base-url: %w", err)
+		return err
 	}
 	if local || yes {
 		return nil
@@ -318,7 +328,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	// Endpoint confirmation and provider construction happen before any
 	// provider call.
-	if err := confirmCustomEndpoint(baseURLFlag, yesCustomFlag, isTerminal(os.Stdin), stdin, os.Stdout); err != nil {
+	if err := confirmCustomEndpoint(baseURLFlag, yesCustomFlag, stdinIsTerminal(), stdin, os.Stdout); err != nil {
 		return err
 	}
 	provider, err := llm.New(llm.Config{
@@ -340,8 +350,10 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		orch.CustomSensitive = askCustomSensitive()
 	}
 
+	// The orchestrator already escapes control characters; escaping again
+	// here keeps the terminal safe whatever produced the text.
 	orch.OnStatus = func(msg string) {
-		fmt.Println(styleStatus(msg))
+		fmt.Println(styleStatus(fileproto.Printable(msg)))
 	}
 
 	orch.OnQuestion = func(questions []string) []string {
@@ -350,7 +362,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		for i, q := range questions {
 			fmt.Printf("\n%s %s\n%s ",
 				paint(ansiCyan, fmt.Sprintf("[%d/%d]", i+1, len(questions))),
-				paint(ansiBold, q),
+				paint(ansiBold, fileproto.Printable(q)),
 				paint(ansiCyan, ">"))
 			answer, _ := stdin.ReadString('\n')
 			answers[i] = strings.TrimSpace(answer)
@@ -377,7 +389,7 @@ negligence when providing this list.`
 // "null" (the default) or an empty answer means none. Non-interactive runs
 // get none.
 func askCustomSensitive() []string {
-	if !isTerminal(os.Stdin) {
+	if !stdinIsTerminal() {
 		fmt.Println(paint(ansiDim, "Custom sensitive values: none (non-interactive input)"))
 		return nil
 	}

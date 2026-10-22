@@ -5,6 +5,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"tf-architect/internal/security"
 )
 
 // Config selects and configures a provider. API keys are read only from the
@@ -25,8 +27,8 @@ func New(cfg Config) (Provider, error) {
 	}
 	base := strings.TrimRight(cfg.BaseURL, "/")
 	if base != "" {
-		if _, err := IsLocalURL(base); err != nil {
-			return nil, fmt.Errorf("--base-url: %w", err)
+		if _, err := CheckBaseURL(base); err != nil {
+			return nil, err
 		}
 	}
 	key := func(name string) (string, error) {
@@ -94,6 +96,21 @@ func New(cfg Config) (Provider, error) {
 		return &openAI{name: "openai-compatible", key: k, model: cfg.Model, baseURL: base}, nil
 	}
 	return nil, fmt.Errorf("unknown provider %q (want claude, anthropic, openai, gemini or openai-compatible)", cfg.Provider)
+}
+
+// CheckBaseURL is IsLocalURL for a user-supplied --base-url: a URL that would
+// carry prompts and the API key unencrypted (or that is not a URL at all) is
+// a *security.Error.
+func CheckBaseURL(raw string) (local bool, err error) {
+	local, err = IsLocalURL(raw)
+	if err != nil {
+		return false, security.New(
+			fmt.Sprintf("--base-url is not allowed: %v.", err),
+			"Prompts and your API key would travel unencrypted or to an endpoint tf-architect cannot secure.",
+			"Use an https:// URL (http:// only for localhost, 127.0.0.1 or [::1]).",
+		)
+	}
+	return local, nil
 }
 
 // IsLocalURL reports whether raw points at this machine (localhost, 127.0.0.1

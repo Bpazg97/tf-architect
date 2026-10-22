@@ -1,8 +1,11 @@
 package llm
 
 import (
+	"errors"
 	"strings"
 	"testing"
+
+	"tf-architect/internal/security"
 )
 
 func TestNewRequiresKeyAndModel(t *testing.T) {
@@ -65,6 +68,16 @@ func TestIsLocalURL(t *testing.T) {
 	for _, raw := range []string{"http://x.com", "ftp://localhost", "not a url", "", "https://"} {
 		if _, err := IsLocalURL(raw); err == nil {
 			t.Errorf("%q: want error", raw)
+		}
+	}
+}
+
+func TestUnsafeBaseURLIsSecurityError(t *testing.T) {
+	for _, u := range []string{"http://example.com/v1", "ftp://example.com", "not a url"} {
+		_, err := New(Config{Provider: "openai", Model: "m", BaseURL: u, Getenv: env(map[string]string{"OPENAI_API_KEY": "k"})})
+		var se *security.Error
+		if !errors.As(err, &se) {
+			t.Errorf("%q: want *security.Error, got %v", u, err)
 		}
 	}
 }

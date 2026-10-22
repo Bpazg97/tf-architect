@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"tf-architect/internal/orchestrator"
 	"tf-architect/internal/security"
 )
 
@@ -203,6 +204,17 @@ func setFlags(t *testing.T, provider, baseURL, agents, out string) {
 		providerFlag, modelFlag, baseURLFlag, yesCustomFlag, agentsFile, outputDir, noMaskFlag, forceFlag = oldP, oldM, oldB, oldY, oldA, oldO, oldN, oldF
 	})
 	providerFlag, modelFlag, baseURLFlag, yesCustomFlag, agentsFile, outputDir, noMaskFlag, forceFlag = provider, "test-model", baseURL, false, agents, out, false, false
+	noTerminal(t, "")
+}
+
+// noTerminal makes the prompts read input instead of the real stdin, as a
+// non-interactive run.
+func noTerminal(t *testing.T, input string) {
+	t.Helper()
+	oldIn, oldTTY := stdin, stdinIsTerminal
+	t.Cleanup(func() { stdin, stdinIsTerminal = oldIn, oldTTY })
+	stdin = bufio.NewReader(strings.NewReader(input))
+	stdinIsTerminal = func() bool { return false }
 }
 
 func writeDoc(t *testing.T, dir string) string {
@@ -322,7 +334,7 @@ func TestCustomEndpointNeedsConfirmation(t *testing.T) {
 func TestSecurityErrorRendersPopup(t *testing.T) {
 	var b bytes.Buffer
 	se := security.New("what happened", "why it matters", "how to fix")
-	if code := reportError(&b, fmt.Errorf("run: %w", se)); code != 2 {
+	if code := reportError(&b, fmt.Errorf("run: %w", se), false); code != 2 {
 		t.Errorf("exit code %d, want 2", code)
 	}
 	if !strings.Contains(b.String(), "SECURITY STOP") || !strings.Contains(b.String(), "Nothing sensitive was sent to the AI provider.") {
@@ -330,13 +342,39 @@ func TestSecurityErrorRendersPopup(t *testing.T) {
 	}
 
 	b.Reset()
-	if code := reportError(&b, context.DeadlineExceeded); code != 1 {
+	if code := reportError(&b, context.DeadlineExceeded, false); code != 1 {
 		t.Errorf("exit code %d, want 1", code)
 	}
 	if got := b.String(); got != "Error: context deadline exceeded\n" || strings.Contains(got, "SECURITY") {
 		t.Errorf("plain error output: %q", got)
 	}
-	if reportError(&b, nil) != 0 {
+	if reportError(&b, nil, false) != 0 {
 		t.Error("nil error must exit 0")
+	}
+
+	b.Reset()
+	if code := reportError(&b, fmt.Errorf("analyze: %w", orchestrator.ErrInterrupted), false); code != 130 {
+		t.Errorf("interrupt exit code %d, want 130", code)
+	}
+	b.Reset()
+	if code := reportError(&b, se, true); code != 2 || strings.Contains(b.String(), "Nothing sensitive was sent") {
+		t.Errorf("--no-mask security stop: code %d\n%s", code, b.String())
+	}
+}
+
+func TestUnsafeBaseURLIsSecurityStop(t *testing.T) {
+	var se *security.Error
+	if err := confirmCustomEndpoint("http://llm.example.com/v1", true, false, nil, io.Discard); !errors.As(err, &se) {
+		t.Errorf("confirmCustomEndpoint: want *security.Error, got %v", err)
+	}
+	work := t.TempDir()
+	t.Chdir(work)
+	doc := writeDoc(t, work)
+	t.Setenv("OPENAI_API_KEY", "k")
+	setFlags(t, "openai", "http://llm.example.com/v1", "", filepath.Join(work, "out"))
+	yesCustomFlag = true
+	var b bytes.Buffer
+	if code := reportError(&b, runGenerate(&cobra.Command{}, []string{doc}), false); code != 2 {
+		t.Errorf("exit code %d, want 2:\n%s", code, b.String())
 	}
 }

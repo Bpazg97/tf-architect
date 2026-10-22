@@ -16,7 +16,7 @@ func TestRenderPopup(t *testing.T) {
 	e := security.New("Masking failed for a file", strings.Repeat("long reason ", 12), "Run again with a valid configuration")
 	for _, color := range []bool{false, true} {
 		colorEnabled = color
-		out := renderPopup(e)
+		out := renderPopup(e, false)
 		for _, want := range []string{e.What, "Why:", "Fix:", "SECURITY STOP", "Nothing sensitive was sent to the AI provider."} {
 			if !strings.Contains(out, want) {
 				t.Errorf("color=%v: missing %q", color, want)
@@ -40,3 +40,13 @@ func TestRenderPopup(t *testing.T) {
 }
 
 var ansiRe = regexp.MustCompile(`\033\[[0-9;]*m`)
+
+func TestRenderPopupNoMask(t *testing.T) {
+	out := renderPopup(security.New("w", "y", "f"), true)
+	if strings.Contains(out, "Nothing sensitive was sent") {
+		t.Errorf("--no-mask pop-up claims nothing sensitive was sent:\n%s", out)
+	}
+	if !strings.Contains(out, "--no-mask") {
+		t.Errorf("--no-mask pop-up does not say masking was off:\n%s", out)
+	}
+}

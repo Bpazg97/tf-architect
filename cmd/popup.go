@@ -11,8 +11,9 @@ const popupWidth = 72
 
 // renderPopup draws a security stop as a boxed terminal pop-up. Color is
 // applied per line so the box keeps equal display width once ANSI codes
-// are stripped.
-func renderPopup(e *security.Error) string {
+// are stripped. With noMask the run sent real values, so the pop-up must
+// not claim otherwise.
+func renderPopup(e *security.Error, noMask bool) string {
 	inner := popupWidth - 4 // "│ " + text + " │"
 	var lines []string      // already padded to inner width
 	add := func(s string) {
@@ -36,7 +37,11 @@ func renderPopup(e *security.Error) string {
 	section("Why:", e.Why)
 	section("Fix:", e.Fix)
 	add("")
-	for _, l := range wrapWords("Nothing sensitive was sent to the AI provider.", inner) {
+	closing := "Nothing sensitive was sent to the AI provider."
+	if noMask {
+		closing = "Masking was disabled (--no-mask): real values may already have been sent to the AI provider."
+	}
+	for _, l := range wrapWords(closing, inner) {
 		add(l)
 	}
 
