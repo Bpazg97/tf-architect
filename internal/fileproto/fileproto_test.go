@@ -182,3 +182,46 @@ func TestApplyRefusesSymlinks(t *testing.T) {
 		t.Fatal("file created outside project")
 	}
 }
+
+func TestValidatePathRejectsControlCharacters(t *testing.T) {
+	for _, p := range []string{"a\x1b[2J.tf", "a\n.tf", "a\x00.tf", "a\x7f.tf", "a\u0085.tf", "a\u009b2J.tf", "a\t.tf"} {
+		var se *security.Error
+		if err := ValidatePath(p); !errors.As(err, &se) {
+			t.Errorf("%q: want *security.Error, got %v", p, err)
+		}
+	}
+	if err := ValidatePath("modules/réseau/main.tf"); err != nil {
+		t.Errorf("non-ASCII printable path rejected: %v", err)
+	}
+}
+
+func TestPrintable(t *testing.T) {
+	cases := map[string]string{
+		"ok ✓ line":           "ok ✓ line",
+		"multi\nline\tx":      "multi\nline\tx",
+		"evil\x1b[2J\r\x07":   `evil\x1b[2J\x0d\x07`,
+		"c1\u009b31m \x7fdel": `c1\u009b31m \x7fdel`,
+	}
+	for in, want := range cases {
+		if got := Printable(in); got != want {
+			t.Errorf("Printable(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestReadProjectChecksSizeBeforeReading(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root reads unreadable files")
+	}
+	dir := t.TempDir()
+	big := filepath.Join(dir, "big.tf")
+	if err := os.WriteFile(big, []byte(strings.Repeat("x", 100)), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	// Unreadable: only a size check before ReadFile yields the budget error.
+	_, err := ReadProject(dir, 50)
+	var se *security.Error
+	if !errors.As(err, &se) {
+		t.Fatalf("want *security.Error, got %v", err)
+	}
+}

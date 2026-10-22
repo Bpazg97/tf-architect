@@ -134,11 +134,13 @@ func (o *Orchestrator) status(format string, args ...interface{}) {
 	}
 }
 
+// display prepares text for the user: placeholders resolved and control
+// characters (which the model or the document may contain) escaped.
 func (o *Orchestrator) display(text string) string {
-	if o.noMask {
-		return text
+	if !o.noMask {
+		text = masking.UnmaskText(text, o.maskMap)
 	}
-	return masking.UnmaskText(text, o.maskMap)
+	return fileproto.Printable(text)
 }
 
 // Interrupt stops the run: the in-flight request is cancelled, nothing more

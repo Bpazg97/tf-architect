@@ -976,3 +976,32 @@ func TestInterruptedProviderErrorIsErrInterrupted(t *testing.T) {
 		t.Fatalf("want ErrInterrupted, got %v", err)
 	}
 }
+
+func TestStatusAndQuestionsEscapeControlCharacters(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	p := &fakeProvider{respond: func(system, prompt string) string {
+		switch {
+		case strings.Contains(prompt, "## TASK: ANALYZE"):
+			return `{"ready": false, "missing": ["Which CIDR?\u001b[2J"], "inconsistencies": [], "summary": "x"}`
+		case strings.Contains(prompt, "## TASK: MODULE root"):
+			return fileBlock("x\x1b]0;pwned\x07.tf", `cidr = "CIDR_PRIVATE_999"`+"\n")
+		}
+		return fakeModel(system, prompt)
+	}}
+	o := orchestrator.New(workDir, outputDir, "", p, false)
+	var shown []string
+	o.OnStatus = func(s string) { shown = append(shown, s) }
+	o.OnQuestion = func(q []string) []string {
+		shown = append(shown, q...)
+		return make([]string, len(q))
+	}
+	_ = o.Run(docPath)
+	all := strings.Join(shown, "\n")
+	if strings.ContainsAny(all, "\x1b\x07") {
+		t.Errorf("control characters reached the UI: %q", all)
+	}
+	if !strings.Contains(all, `Which CIDR?\x1b[2J`) || !strings.Contains(all, `x\x1b]0;pwned\x07.tf`) {
+		t.Errorf("escaped text missing: %q", all)
+	}
+}

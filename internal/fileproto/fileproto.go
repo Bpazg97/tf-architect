@@ -124,6 +124,9 @@ func ValidatePath(p string) error {
 	if strings.TrimSpace(p) == "" {
 		return unsafe("Empty file paths are not allowed.")
 	}
+	if strings.IndexFunc(p, isControl) >= 0 {
+		return unsafe("Control characters in a path can rewrite what the terminal shows.")
+	}
 	norm := strings.ReplaceAll(p, "\\", "/")
 	if strings.HasPrefix(norm, "/") || filepath.IsAbs(p) || filepath.VolumeName(p) != "" || (len(norm) > 1 && norm[1] == ':') {
 		return unsafe("Absolute paths could write outside your project.")
@@ -139,6 +142,33 @@ func ValidatePath(p string) error {
 		return unsafe("Only .tf, .tfvars, .md, .json, .tpl, .yaml, .yml and .sh files are allowed.")
 	}
 	return nil
+}
+
+// isControl reports C0 controls, DEL and C1 controls: runes that terminals
+// interpret instead of printing.
+func isControl(r rune) bool {
+	return r < 0x20 || r == 0x7f || r >= 0x80 && r <= 0x9f
+}
+
+// Printable escapes control characters (except newline and tab) in text
+// that came from the model or a document, so it cannot drive the terminal
+// it is shown on.
+func Printable(s string) string {
+	if strings.IndexFunc(s, func(r rune) bool { return isControl(r) && r != '\n' && r != '\t' }) < 0 {
+		return s
+	}
+	var sb strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\t' || !isControl(r):
+			sb.WriteRune(r)
+		case r < 0x80:
+			fmt.Fprintf(&sb, `\x%02x`, r)
+		default:
+			fmt.Fprintf(&sb, `\u%04x`, r)
+		}
+	}
+	return sb.String()
 }
 
 // Apply writes (or deletes) the changes under dir. Every path is validated
@@ -216,17 +246,24 @@ func ReadProject(dir string, budget int) (map[string]string, error) {
 		if err != nil {
 			return err
 		}
+		overBudget := func() error {
+			return security.New(
+				fmt.Sprintf("The project is larger than the %d byte limit for one AI request.", budget),
+				"Sending everything would exceed the size the tool can safely mask and review.",
+				"Remove generated or unrelated files from the project directory, or split it into smaller projects.",
+			)
+		}
+		// Checked before reading, so a huge file is never loaded.
+		if info.Size() > int64(budget-total) {
+			return overBudget()
+		}
 		b, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
 		total += len(b)
 		if total > budget {
-			return security.New(
-				fmt.Sprintf("The project is larger than the %d byte limit for one AI request.", budget),
-				"Sending everything would exceed the size the tool can safely mask and review.",
-				"Remove generated or unrelated files from the project directory, or split it into smaller projects.",
-			)
+			return overBudget()
 		}
 		files[filepath.ToSlash(rel)] = string(b)
 		return nil
