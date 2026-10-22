@@ -26,12 +26,16 @@ func (g *gemini) Complete(ctx context.Context, system, prompt string) (string, e
 			Content struct {
 				Parts []part `json:"parts"`
 			} `json:"content"`
+			FinishReason string `json:"finishReason"`
 		} `json:"candidates"`
 	}
 	endpoint := g.baseURL + "/models/" + url.PathEscape(g.model) + ":generateContent"
 	err := postJSON(ctx, endpoint, map[string]string{"x-goog-api-key": g.key}, body, &resp)
 	if err != nil {
 		return "", errors.New("gemini: " + err.Error())
+	}
+	if len(resp.Candidates) > 0 && resp.Candidates[0].FinishReason == "MAX_TOKENS" {
+		return "", truncated("gemini")
 	}
 	var sb strings.Builder
 	if len(resp.Candidates) > 0 {

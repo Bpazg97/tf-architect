@@ -27,6 +27,7 @@ func (a *anthropic) Complete(ctx context.Context, system, prompt string) (string
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
+		StopReason string `json:"stop_reason"`
 	}
 	err := postJSON(ctx, a.baseURL+"/messages", map[string]string{
 		"x-api-key":         a.key,
@@ -34,6 +35,9 @@ func (a *anthropic) Complete(ctx context.Context, system, prompt string) (string
 	}, body, &resp)
 	if err != nil {
 		return "", errors.New("anthropic: " + err.Error())
+	}
+	if resp.StopReason == "max_tokens" {
+		return "", truncated("anthropic")
 	}
 	var sb strings.Builder
 	for _, c := range resp.Content {

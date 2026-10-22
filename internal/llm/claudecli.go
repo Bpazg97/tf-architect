@@ -29,7 +29,12 @@ type ClaudeCLI struct {
 	Bin       string // defaults to "claude"
 	Model     string // passed as --model when set
 	ConfigDir string // defaults to $CLAUDE_CONFIG_DIR, else ~/.claude
+
+	warn func(string)
 }
+
+// SetWarn sets where non-fatal problems are reported.
+func (c *ClaudeCLI) SetWarn(fn func(string)) { c.warn = fn }
 
 // Name identifies the provider.
 func (c *ClaudeCLI) Name() string { return "claude" }
@@ -48,7 +53,11 @@ func (c *ClaudeCLI) Complete(ctx context.Context, system, prompt string) (string
 		return "", fmt.Errorf("creating claude working dir: %w", err)
 	}
 	defer os.RemoveAll(cwd)
-	defer c.removeTranscript(cwd)
+	defer func() {
+		if c.removeTranscript(cwd) && c.warn != nil {
+			c.warn("removed a Claude CLI transcript that should not exist (--no-session-persistence was ignored)")
+		}
+	}()
 
 	// The system prompt goes through a file and the prompt through stdin:
 	// argv is size-limited (128 KiB per argument on Linux), visible in ps,
@@ -97,6 +106,10 @@ func (c *ClaudeCLI) Complete(ctx context.Context, system, prompt string) (string
 		return "", fmt.Errorf("claude exited: %w%s", waitErr, formatStderr(stderr.String()))
 	case !st.sawInit:
 		return "", missingInit()
+	case !st.sawResult:
+		return "", fmt.Errorf("claude sent no result event%s", formatStderr(stderr.String()))
+	case st.truncated:
+		return "", truncated("claude")
 	}
 	return st.text.String(), nil
 }
@@ -125,18 +138,25 @@ func (c *ClaudeCLI) configDir() string {
 // removeTranscript deletes the CLI's project dir for our temp cwd, in case
 // --no-session-persistence is ever ignored. The cwd is a fresh temp dir, so
 // that project dir can only be ours; nothing else under ConfigDir is touched.
-func (c *ClaudeCLI) removeTranscript(cwd string) {
+// It reports whether a transcript existed.
+func (c *ClaudeCLI) removeTranscript(cwd string) bool {
 	root := c.configDir()
 	if root == "" {
-		return
+		return false
 	}
+	found := false
 	paths := []string{cwd}
 	if real, err := filepath.EvalSymlinks(cwd); err == nil && real != cwd {
 		paths = append(paths, real)
 	}
 	for _, p := range paths {
-		_ = os.RemoveAll(filepath.Join(root, "projects", slug(p)))
+		dir := filepath.Join(root, "projects", slug(p))
+		if _, err := os.Lstat(dir); err == nil {
+			found = true
+		}
+		_ = os.RemoveAll(dir)
 	}
+	return found
 }
 
 func (c *ClaudeCLI) buildArgs(systemFile string) []string {
@@ -163,6 +183,8 @@ func (c *ClaudeCLI) buildArgs(systemFile string) []string {
 type streamState struct {
 	text      strings.Builder
 	sawInit   bool
+	sawResult bool
+	truncated bool // the model stopped at its output limit
 	violation error
 	resultErr error
 	scanErr   error
@@ -212,11 +234,21 @@ func readEvents(stdout io.Reader, cwd string, cancel func()) *streamState {
 				continue
 			}
 			st.text.WriteString(text)
+			if msg, _ := ev["message"].(map[string]any); msg["stop_reason"] == "max_tokens" {
+				st.truncated = true
+			}
 
 		case "result":
-			if isErr, _ := ev["is_error"].(bool); isErr {
+			st.sawResult = true
+			isErr, _ := ev["is_error"].(bool)
+			subtype, _ := ev["subtype"].(string)
+			if isErr {
 				result, _ := ev["result"].(string)
 				st.resultErr = fmt.Errorf("claude error: %s", result)
+			} else if subtype != "success" {
+				// The result text of a failed run is not trustworthy, and
+				// may be partial: never return it.
+				st.resultErr = fmt.Errorf("claude run did not succeed (result subtype %q)", subtype)
 			}
 		}
 	}

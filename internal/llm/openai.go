@@ -25,6 +25,7 @@ func (o *openAI) Complete(ctx context.Context, system, prompt string) (string, e
 			Message struct {
 				Content string `json:"content"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 	}
 	err := postJSON(ctx, o.baseURL+"/chat/completions", map[string]string{
@@ -32,6 +33,9 @@ func (o *openAI) Complete(ctx context.Context, system, prompt string) (string, e
 	}, body, &resp)
 	if err != nil {
 		return "", errors.New(o.name + ": " + err.Error())
+	}
+	if len(resp.Choices) > 0 && resp.Choices[0].FinishReason == "length" {
+		return "", truncated(o.name)
 	}
 	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
 		return "", errors.New(o.name + ": empty response")

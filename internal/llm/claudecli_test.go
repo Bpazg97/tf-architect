@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"tf-architect/internal/fileproto"
 	"tf-architect/internal/security"
 )
 
@@ -63,9 +64,19 @@ func TestHelperClaude(t *testing.T) {
 		lines = append(lines, strings.Replace(clean, `"path":"builtin"`, `"path":"/home/u/.claude/plugins/caveman"`, 1))
 	case "none":
 	}
+	stop := "end_turn"
+	if os.Getenv("HELPER_RESULT") == "truncated" {
+		stop = "max_tokens"
+	}
 	lines = append(lines,
-		`{"type":"assistant","message":{"content":[{"type":"text","text":"SECRET-ANSWER"}]}}`,
-		`{"type":"result","is_error":false,"result":"SECRET-ANSWER"}`)
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"SECRET-ANSWER"}],"stop_reason":"`+stop+`"}}`)
+	switch os.Getenv("HELPER_RESULT") {
+	case "", "truncated":
+		lines = append(lines, `{"type":"result","subtype":"success","is_error":false,"result":"SECRET-ANSWER"}`)
+	case "max-turns":
+		lines = append(lines, `{"type":"result","subtype":"error_max_turns","is_error":false,"result":"SECRET-ANSWER"}`)
+	case "none":
+	}
 	for _, l := range lines {
 		fmt.Println(l)
 	}
@@ -85,6 +96,7 @@ func stubCLI(t *testing.T, init string) (*ClaudeCLI, string) {
 	}
 	t.Setenv("HELPER_OUT", out)
 	t.Setenv("HELPER_INIT", init)
+	t.Setenv("HELPER_RESULT", "")
 	return &ClaudeCLI{Bin: script, ConfigDir: filepath.Join(dir, "config")}, out
 }
 
@@ -236,8 +248,13 @@ func TestTranscriptCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var warnings []string
+	c.SetWarn(func(w string) { warnings = append(warnings, w) })
 	if _, err := c.Complete(context.Background(), "SYS", "PROMPT"); err != nil {
 		t.Fatal(err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "transcript") {
+		t.Errorf("removed transcript not reported: %q", warnings)
 	}
 	transcript := filepath.Join(c.ConfigDir, "projects", slug(readRecord(t, out).Cwd))
 	if _, err := os.Stat(transcript); !os.IsNotExist(err) {
@@ -303,5 +320,38 @@ func TestPromptIsNotAnOption(t *testing.T) {
 	}
 	if slices.Contains(rec.Args, "--tools=Bash") {
 		t.Errorf("prompt reached argv: %q", rec.Args)
+	}
+}
+
+func TestClaudeResultMustBeSuccess(t *testing.T) {
+	for _, result := range []string{"max-turns", "none"} {
+		t.Run(result, func(t *testing.T) {
+			c, _ := stubCLI(t, "clean")
+			t.Setenv("HELPER_RESULT", result)
+			got, err := c.Complete(context.Background(), "SYS", "PROMPT")
+			if err == nil {
+				t.Fatalf("want error, got %q", got)
+			}
+		})
+	}
+}
+
+func TestClaudeMaxTokensIsErrTruncated(t *testing.T) {
+	c, _ := stubCLI(t, "clean")
+	t.Setenv("HELPER_RESULT", "truncated")
+	if _, err := c.Complete(context.Background(), "SYS", "PROMPT"); !errors.Is(err, fileproto.ErrTruncated) {
+		t.Fatalf("want ErrTruncated, got %v", err)
+	}
+}
+
+func TestNoTranscriptNoWarning(t *testing.T) {
+	c, _ := stubCLI(t, "clean")
+	var warnings []string
+	c.SetWarn(func(w string) { warnings = append(warnings, w) })
+	if _, err := c.Complete(context.Background(), "SYS", "PROMPT"); err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("unexpected warnings: %q", warnings)
 	}
 }

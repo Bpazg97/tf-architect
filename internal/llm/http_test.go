@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"tf-architect/internal/fileproto"
 )
 
 const testKey = "sk-test-SECRET-123456"
@@ -246,5 +249,59 @@ func TestRedirectNotFollowed(t *testing.T) {
 				t.Fatalf("err=%v hitsB=%d", err, hitsB.Load())
 			}
 		})
+	}
+}
+
+func TestTruncatedResponseIsErrTruncated(t *testing.T) {
+	cases := map[string]string{
+		"anthropic":         `{"content":[{"type":"text","text":"FILE: a.tf"}],"stop_reason":"max_tokens"}`,
+		"openai":            `{"choices":[{"message":{"content":"FILE: a.tf"},"finish_reason":"length"}]}`,
+		"openai-compatible": `{"choices":[{"message":{"content":"FILE: a.tf"},"finish_reason":"length"}]}`,
+		"gemini":            `{"candidates":[{"content":{"parts":[{"text":"FILE: a.tf"}]},"finishReason":"MAX_TOKENS"}]}`,
+	}
+	for provider, reply := range cases {
+		t.Run(provider, func(t *testing.T) {
+			srv, _, _ := captureServer(t, reply)
+			p := newTest(t, provider, "m", srv.URL)
+			// Through the Client, as the orchestrator calls it.
+			c := NewClient(p, "SYS")
+			c.SetGate(func(s string) (string, error) { return s, nil })
+			_, err := c.Query(context.Background(), "hi")
+			if !errors.Is(err, fileproto.ErrTruncated) {
+				t.Fatalf("want ErrTruncated, got %v", err)
+			}
+		})
+	}
+}
+
+func TestCompleteResponseNotTruncated(t *testing.T) {
+	cases := map[string]string{
+		"anthropic": `{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`,
+		"openai":    `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`,
+		"gemini":    `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`,
+	}
+	for provider, reply := range cases {
+		srv, _, _ := captureServer(t, reply)
+		if out, err := newTest(t, provider, "m", srv.URL).Complete(context.Background(), "S", "p"); err != nil || out != "ok" {
+			t.Errorf("%s: out=%q err=%v", provider, out, err)
+		}
+	}
+}
+
+func TestResponseBodyIsSizeLimited(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"`)
+		chunk := strings.Repeat("a", 1<<20)
+		for i := 0; i < maxResponseBody>>20+2; i++ {
+			if _, err := io.WriteString(w, chunk); err != nil {
+				return
+			}
+		}
+		_, _ = io.WriteString(w, `"}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	_, err := newTest(t, "anthropic", "m", srv.URL).Complete(context.Background(), "S", "p")
+	if err == nil {
+		t.Fatal("oversized response body must be rejected")
 	}
 }

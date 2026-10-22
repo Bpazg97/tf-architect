@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"tf-architect/internal/fileproto"
 )
 
 // Provider sends one self-contained request to a model and returns its text.
@@ -19,6 +21,18 @@ type Provider interface {
 // data is sent, that they are reachable and configured safely.
 type Preflighter interface {
 	Preflight(ctx context.Context) error
+}
+
+// Warner is implemented by providers that can report non-fatal problems
+// (the orchestrator shows them as status warnings).
+type Warner interface {
+	SetWarn(func(string))
+}
+
+// truncated is the error a provider returns when the model stopped at its
+// output limit: the text is incomplete, so callers retry or stop.
+func truncated(provider string) error {
+	return fmt.Errorf("%s: %w", provider, fileproto.ErrTruncated)
 }
 
 // Client is the single choke point between tf-architect and a Provider.

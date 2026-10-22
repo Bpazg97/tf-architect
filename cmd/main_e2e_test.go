@@ -107,7 +107,7 @@ func TestHelperClaude(t *testing.T) {
 	fmt.Println(`{"type":"system","subtype":"init","cwd":` + string(cwdJSON) +
 		`,"tools":[],"mcp_servers":[],"plugins":[{"name":"cc-plugin-agents-md","path":"builtin","source":"cc-plugin-agents-md@builtin"}],"claude_code_version":"2.1.306"}`)
 	fmt.Println(`{"type":"assistant","message":{"content":[{"type":"text","text":` + string(text) + `}]}}`)
-	fmt.Println(`{"type":"result","is_error":false,"result":` + string(text) + `}`)
+	fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":` + string(text) + `}`)
 	os.Exit(0)
 }
 

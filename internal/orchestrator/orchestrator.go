@@ -119,6 +119,9 @@ func New(workDir, outputDir, agents string, p llm.Provider, noMask bool) *Orches
 	}
 	// Set even with noMask: the client refuses to send without a gate.
 	o.client.SetGate(o.outgoing)
+	if w, ok := p.(llm.Warner); ok {
+		w.SetWarn(func(msg string) { o.status("Warning: %s", msg) })
+	}
 	return o
 }
 
@@ -265,11 +268,14 @@ func (o *Orchestrator) ask(sess *state.Session, header, body string, withContext
 // stops the run.
 func (o *Orchestrator) completeFiles(sess *state.Session, header, body string) ([]fileproto.Change, error) {
 	for attempt := 0; ; attempt++ {
+		// Truncation is reported by the provider (output limit reached)
+		// or detected by Parse (an unclosed FILE block).
 		resp, err := o.ask(sess, header, body, true)
-		if err != nil {
-			return nil, err
+		var changes []fileproto.Change
+		var warnings []string
+		if err == nil {
+			changes, warnings, err = fileproto.Parse(resp)
 		}
-		changes, warnings, err := fileproto.Parse(resp)
 		if errors.Is(err, fileproto.ErrTruncated) {
 			if attempt == 0 {
 				o.status("Warning: the AI response was cut off — retrying once")

@@ -3,12 +3,14 @@ package orchestrator_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
+	"tf-architect/internal/fileproto"
 	"tf-architect/internal/orchestrator"
 	"tf-architect/internal/security"
 	"tf-architect/internal/state"
@@ -85,6 +87,8 @@ type fakeProvider struct {
 	mu      sync.Mutex
 	calls   []call
 	respond func(system, prompt string) string
+	// fail, when set and returning non-nil, is returned instead of an answer.
+	fail func(prompt string) error
 }
 
 func (f *fakeProvider) Name() string { return "fake" }
@@ -93,6 +97,11 @@ func (f *fakeProvider) Complete(_ context.Context, system, prompt string) (strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, call{system, prompt})
+	if f.fail != nil {
+		if err := f.fail(prompt); err != nil {
+			return "", err
+		}
+	}
 	if f.respond != nil {
 		return f.respond(system, prompt), nil
 	}
@@ -601,6 +610,59 @@ func TestTruncatedTwiceStops(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("MODULE vpc called %d times, want 2", n)
+	}
+}
+
+func TestProviderTruncationIsRetried(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	n := 0
+	p := &fakeProvider{fail: func(prompt string) error {
+		if strings.Contains(prompt, "## TASK: MODULE vpc") {
+			if n++; n == 1 {
+				return fmt.Errorf("fake: %w", fileproto.ErrTruncated)
+			}
+		}
+		return nil
+	}}
+	o := orchestrator.New(workDir, outputDir, "", p, false)
+	var status []string
+	o.OnStatus = func(s string) { status = append(status, s) }
+	if err := o.Run(docPath); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("MODULE vpc called %d times, want 2", n)
+	}
+	if !strings.Contains(strings.Join(status, "\n"), "cut off") {
+		t.Errorf("retry not reported: %q", status)
+	}
+}
+
+// warnProvider reports one provider warning per call.
+type warnProvider struct {
+	fakeProvider
+	warn func(string)
+}
+
+func (w *warnProvider) SetWarn(fn func(string)) { w.warn = fn }
+
+func (w *warnProvider) Complete(ctx context.Context, system, prompt string) (string, error) {
+	w.warn("removed a Claude CLI transcript that should not exist")
+	return w.fakeProvider.Complete(ctx, system, prompt)
+}
+
+func TestProviderWarningsShownAsStatus(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	o := orchestrator.New(workDir, outputDir, "", &warnProvider{}, false)
+	var status []string
+	o.OnStatus = func(s string) { status = append(status, s) }
+	if err := o.Run(docPath); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(strings.Join(status, "\n"), "Warning: removed a Claude CLI transcript") {
+		t.Errorf("provider warning not shown: %q", status)
 	}
 }
 

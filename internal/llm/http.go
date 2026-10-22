@@ -18,6 +18,10 @@ var retryDelays = []time.Duration{time.Second, 2 * time.Second}
 
 const maxErrBody = 500
 
+// maxResponseBody caps a 2xx body: a broken or hostile endpoint must not
+// make tf-architect read without bound.
+const maxResponseBody = 32 << 20
+
 // Redirects are never followed: Go would re-send custom key headers and the
 // POST body (the prompt) to the target, bypassing the HTTPS/local-only rule.
 // A 3xx surfaces as a non-2xx error.
@@ -78,7 +82,7 @@ func postOnce(ctx context.Context, url string, headers map[string]string, payloa
 		retry = resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 		return retry, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(msg))
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(out); err != nil {
 		return false, fmt.Errorf("decoding response: %s", scrub(err.Error()))
 	}
 	return false, nil
