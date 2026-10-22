@@ -54,7 +54,7 @@ func AddCustom(mm MaskMap, values []string) MaskMap {
 }
 
 // replaceCustom masks every case variant of the custom values ("Phoenix",
-// "phoenix-api", "PHOENIX") that is not inside an existing placeholder.
+// "phoenix-api", "PHOENIX") that is not inside a known placeholder.
 func (s *maskState) replaceCustom(text string) string {
 	var customs []string
 	for ph, real := range s.mm {
@@ -65,10 +65,14 @@ func (s *maskState) replaceCustom(text string) string {
 	sort.Slice(customs, func(i, j int) bool { return len(customs[i]) > len(customs[j]) })
 	for _, v := range customs {
 		re := regexp.MustCompile(`(?i)` + regexp.QuoteMeta(v))
-		spans := placeholderRe.FindAllStringIndex(text, -1)
+		matches := re.FindAllStringIndex(text, -1)
+		if matches == nil {
+			continue
+		}
+		spans := placeholderSpans(text, s.mm)
 		var sb strings.Builder
 		last := 0
-		for _, m := range re.FindAllStringIndex(text, -1) {
+		for _, m := range matches {
 			if overlapsAny(spans, m[0], m[1]) {
 				continue
 			}
@@ -82,50 +86,105 @@ func (s *maskState) replaceCustom(text string) string {
 	return text
 }
 
-// UnmaskText replaces placeholders in text with their real values.
+// UnmaskText replaces placeholders in text with their real values. Only
+// occurrences that Mask would produce again from the real value are restored
+// (see restorable); any other placeholder-shaped text is left as is, so that
+// restoring and re-masking can never turn a placeholder into an unmasked
+// value.
 func UnmaskText(text string, mm MaskMap) string {
-	// Longer placeholders first: FOO_100 must not corrupt FOO_1000.
-	pairs := make([][2]string, 0, len(mm))
-	for ph, real := range mm {
-		pairs = append(pairs, [2]string{ph, real})
-	}
-	sort.Slice(pairs, func(i, j int) bool { return len(pairs[i][0]) > len(pairs[j][0]) })
-
 	// A real value may itself contain a placeholder (an ARN masked after its
 	// account ID was): repeat until stable. Each pass resolves one level.
-	for i := 0; i <= len(pairs); i++ {
-		next := text
-		for _, p := range pairs {
-			next = replacePlaceholder(next, p[0], p[1])
-		}
-		if next == text {
+	for pass := 0; pass <= len(mm); pass++ {
+		spans := placeholderSpans(text, mm)
+		if len(spans) == 0 {
 			break
 		}
-		text = next
+		var sb strings.Builder
+		last := 0
+		for _, sp := range spans {
+			sb.WriteString(text[last:sp[0]])
+			sb.WriteString(mm[text[sp[0]:sp[1]]])
+			last = sp[1]
+		}
+		sb.WriteString(text[last:])
+		text = sb.String()
 	}
 	return text
 }
 
 // UnresolvedPlaceholders returns, in order of first appearance, the
-// placeholder-shaped tokens in text that mm cannot resolve: values the model
-// invented or altered, which would be written to disk verbatim.
+// placeholder-shaped tokens in text that UnmaskText leaves as they are:
+// values the model invented, altered or glued to other characters, which
+// would be written to disk verbatim. Each is reported with the letters and
+// digits touching it ("BUCKET_001v2").
 func UnresolvedPlaceholders(text string, mm MaskMap) []string {
-	known := make(map[string]bool, len(mm))
-	for ph := range mm {
-		// arn:aws:RESOURCE_001 is matched by its RESOURCE_001 body.
-		for _, body := range placeholderRe.FindAllString(ph, -1) {
-			known[body] = true
-		}
-	}
+	resolved := placeholderSpans(text, mm)
 	var unknown []string
 	seen := map[string]bool{}
-	for _, tok := range placeholderRe.FindAllString(text, -1) {
-		if !known[tok] && !seen[tok] {
+	for _, m := range placeholderRe.FindAllStringIndex(text, -1) {
+		if overlapsAny(resolved, m[0], m[1]) {
+			continue
+		}
+		start, end := m[0], m[1]
+		for isAlnumAt(text, start-1) {
+			start--
+		}
+		for isAlnumAt(text, end) {
+			end++
+		}
+		if tok := text[start:end]; !seen[tok] {
 			seen[tok] = true
 			unknown = append(unknown, tok)
 		}
 	}
 	return unknown
+}
+
+// arnPrefix is the literal prefix of RESOURCE placeholders.
+const arnPrefix = "arn:aws:"
+
+// placeholderSpans returns, in order, the [start, end) spans of the
+// occurrences of mm's placeholders in text that UnmaskText restores. They
+// are also the spans Mask protects from re-masking: only these are genuine
+// placeholders; other placeholder-shaped text is ordinary text whose
+// sensitive values must still be masked.
+func placeholderSpans(text string, mm MaskMap) [][]int {
+	var spans [][]int
+	for _, m := range placeholderRe.FindAllStringIndex(text, -1) {
+		// A placeholder body ends with its digits, so an occurrence ends
+		// where the token does; it may start anywhere inside it
+		// ("ZEBRA_TEAM_001" holds TEAM_001). The leftmost is the longest.
+		for start := m[0]; start < m[1]; start++ {
+			if start >= len(arnPrefix) && text[start-len(arnPrefix):start] == arnPrefix {
+				if s := start - len(arnPrefix); restorable(text, s, m[1], mm) {
+					spans = append(spans, []int{s, m[1]})
+					break
+				}
+			}
+			if restorable(text, start, m[1], mm) {
+				spans = append(spans, []int{start, m[1]})
+				break
+			}
+		}
+	}
+	return spans
+}
+
+// restorable reports whether text[start:end] is a placeholder of mm that
+// Mask would produce again from its real value. Known values are masked
+// only where no letter or digit touches them (replaceBounded), so such a
+// placeholder is restored only under the same condition. Custom values are
+// masked wherever they appear, so their placeholders are restored anywhere
+// except before a digit (CUSTOM_001 inside CUSTOM_0012).
+func restorable(text string, start, end int, mm MaskMap) bool {
+	ph := text[start:end]
+	if _, ok := mm[ph]; !ok {
+		return false
+	}
+	if cat, _ := parsePlaceholder(ph); cat == customCategory {
+		return end >= len(text) || text[end] < '0' || text[end] > '9'
+	}
+	return !isAlnumAt(text, start-1) && !isAlnumAt(text, end)
 }
 
 // SaveMaskMap writes mm to path as JSON with 0600 permissions.
@@ -184,19 +243,19 @@ func (s *maskState) replaceKnown(text string) string {
 	}
 	sort.Slice(reals, func(i, j int) bool { return len(reals[i]) > len(reals[j]) })
 	for _, real := range reals {
-		text = replaceBounded(text, real, s.realToPlaceholder[real])
+		text = s.replaceBounded(text, real, s.realToPlaceholder[real])
 	}
 	return text
 }
 
 // replaceBounded replaces occurrences of from that are not part of a longer
 // alphanumeric token ("dev" must not hit "device", "10.0.0.1" must not hit
-// "10.0.0.15") and that do not fall inside an existing placeholder.
-func replaceBounded(text, from, to string) string {
+// "10.0.0.15") and that do not fall inside a known placeholder.
+func (s *maskState) replaceBounded(text, from, to string) string {
 	if !strings.Contains(text, from) {
 		return text
 	}
-	spans := placeholderRe.FindAllStringIndex(text, -1)
+	spans := placeholderSpans(text, s.mm)
 	var sb strings.Builder
 	i := 0
 	for {
@@ -213,32 +272,6 @@ func replaceBounded(text, from, to string) string {
 			sb.WriteString(text[i : start+1])
 			i = start + 1
 		}
-	}
-	sb.WriteString(text[i:])
-	return sb.String()
-}
-
-// replacePlaceholder replaces ph unless it is followed by a digit
-// (ACCOUNT_100 inside ACCOUNT_1000).
-func replacePlaceholder(text, ph, real string) string {
-	if !strings.Contains(text, ph) {
-		return text
-	}
-	var sb strings.Builder
-	i := 0
-	for {
-		j := strings.Index(text[i:], ph)
-		if j < 0 {
-			break
-		}
-		start, end := i+j, i+j+len(ph)
-		sb.WriteString(text[i:start])
-		if end < len(text) && text[end] >= '0' && text[end] <= '9' {
-			sb.WriteString(ph)
-		} else {
-			sb.WriteString(real)
-		}
-		i = end
 	}
 	sb.WriteString(text[i:])
 	return sb.String()

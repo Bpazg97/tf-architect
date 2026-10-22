@@ -1,8 +1,10 @@
 package masking_test
 
 import (
+	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -343,5 +345,92 @@ func TestCustomValuesMaskedAnyCaseAndPosition(t *testing.T) {
 	}
 	if got := masking.UnmaskText(masked, mm); got != in {
 		t.Errorf("round trip mismatch:\nwant %s\ngot  %s", in, got)
+	}
+}
+
+// leakedValue returns a real value of mm (fully resolved: stored values may
+// hold nested placeholders) present in text, custom values in any case, or "".
+func leakedValue(text string, mm masking.MaskMap) string {
+	for ph, real := range mm {
+		real = masking.UnmaskText(real, mm)
+		if strings.Contains(text, real) {
+			return real
+		}
+		if strings.HasPrefix(ph, "CUSTOM_") && strings.Contains(strings.ToLower(text), strings.ToLower(real)) {
+			return real
+		}
+	}
+	return ""
+}
+
+func TestRestoreRemaskNeverLeaks(t *testing.T) {
+	mm := masking.AddCustom(nil, []string{"phoenix"})
+	_, mm, _ = masking.Mask(`bucket = "acme-logs"
+Name = "phoenixprod"
+account 123456789012
+ip 10.0.0.1
+role = "arn:aws:iam::123456789012:role/acme-admin"`, mm)
+	var phs []string
+	for ph := range mm {
+		phs = append(phs, ph)
+	}
+	sort.Strings(phs)
+	adj := []string{"", "", "v2", "x", "pre", "7", "_", "-", ".", " ", "Z", "_X_001", "00"}
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < 5000; i++ {
+		var sb strings.Builder
+		for n := 1 + rng.Intn(4); n > 0; n-- {
+			sb.WriteString(adj[rng.Intn(len(adj))])
+			sb.WriteString(phs[rng.Intn(len(phs))])
+			sb.WriteString(adj[rng.Intn(len(adj))])
+		}
+		model := sb.String()
+		restored := masking.UnmaskText(model, mm)
+		remasked, _, _ := masking.Mask(restored, mm)
+		if v := leakedValue(remasked, mm); v != "" {
+			t.Fatalf("model text %q restored to %q, re-masked to %q: %q sent unmasked", model, restored, remasked, v)
+		}
+	}
+}
+
+func TestPlaceholderTouchingAlnumNotRestored(t *testing.T) {
+	mm := masking.MaskMap{"BUCKET_001": "acme-logs", "TAG_VALUE_001": "phoenixprod"}
+	for _, in := range []string{"BUCKET_001v2", "preTAG_VALUE_001", "xBUCKET_001"} {
+		if got := masking.UnmaskText(in, mm); got != in {
+			t.Errorf("UnmaskText(%q) = %q, want unchanged", in, got)
+		}
+	}
+	if got := masking.UnmaskText("b-BUCKET_001_x", mm); got != "b-acme-logs_x" {
+		t.Errorf("bounded placeholder not restored: %q", got)
+	}
+	got := masking.UnresolvedPlaceholders("a BUCKET_001v2 preTAG_VALUE_001 BUCKET_001", mm)
+	if strings.Join(got, ",") != "BUCKET_001v2,preTAG_VALUE_001" {
+		t.Errorf("UnresolvedPlaceholders = %v", got)
+	}
+}
+
+func TestCustomValueInsideUnknownPlaceholderShapeIsMasked(t *testing.T) {
+	mm := masking.AddCustom(nil, []string{"zebra"})
+	for _, in := range []string{"ZEBRA_TEAM_001", "ZEBRA_100", "team ZEBRA_100 x"} {
+		masked, mm2, _ := masking.Mask(in, mm)
+		if v := leakedValue(masked, mm2); v != "" {
+			t.Errorf("Mask(%q) = %q: %q sent unmasked", in, masked, v)
+		}
+		if got := masking.UnmaskText(masked, mm2); got != in {
+			t.Errorf("round trip of %q: got %q", in, got)
+		}
+	}
+	// Known placeholders stay protected from custom values that match them.
+	mm = masking.AddCustom(masking.MaskMap{"ACCOUNT_001": "123456789012"}, []string{"account"})
+	if masked, _, _ := masking.Mask("id ACCOUNT_001 account", mm); !strings.HasPrefix(masked, "id ACCOUNT_001 CUSTOM_") {
+		t.Errorf("known placeholder corrupted: %q", masked)
+	}
+}
+
+func TestKnownValueInsideUnknownPlaceholderShapeIsMasked(t *testing.T) {
+	mm := masking.MaskMap{"TAG_VALUE_001": "TEAM"}
+	masked, mm, _ := masking.Mask("x TEAM_100 y", mm)
+	if v := leakedValue(masked, mm); v != "" {
+		t.Errorf("known value inside unknown token sent unmasked: %q", masked)
 	}
 }
