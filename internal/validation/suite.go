@@ -22,9 +22,9 @@ type ValidationResult struct {
 
 type Suite struct {
 	Dir string
-	// Env is appended to the environment of every validator subprocess
-	// (e.g. TF_DATA_DIR when validating a copy of the project).
-	Env []string
+	// SkipTerraform, when set, is the reason terraform init/validate are not
+	// run (they fetch module sources over the network).
+	SkipTerraform string
 }
 
 func New(dir string) *Suite {
@@ -35,7 +35,14 @@ func New(dir string) *Suite {
 func (s *Suite) Run() ([]ValidationResult, error) {
 	var results []ValidationResult
 
-	if _, err := exec.LookPath("terraform"); err != nil {
+	if s.SkipTerraform != "" {
+		results = append(results, ValidationResult{
+			Stage:   "terraform init/validate",
+			Passed:  true,
+			Skipped: true,
+			Output:  s.SkipTerraform,
+		})
+	} else if _, err := exec.LookPath("terraform"); err != nil {
 		results = append(results, ValidationResult{
 			Stage:   "terraform init/validate",
 			Passed:  true,
@@ -75,11 +82,20 @@ func (s *Suite) Run() ([]ValidationResult, error) {
 }
 
 func (s *Suite) command(name string, args ...string) *exec.Cmd {
-	cmd := exec.Command(name, args...)
-	if len(s.Env) > 0 {
-		cmd.Env = append(os.Environ(), s.Env...)
+	return exec.Command(name, args...)
+}
+
+var moduleSourceRe = regexp.MustCompile(`(?m)^\s*source\s*=\s*"([^"]*)"`)
+
+// ModuleSources returns the source attribute values in the .tf files under
+// dir: what terraform init fetches.
+func ModuleSources(dir string) []string {
+	files, _ := fsutil.TFFiles(dir)
+	var out []string
+	for _, m := range moduleSourceRe.FindAllStringSubmatch(concatenateTFFiles(files), -1) {
+		out = append(out, m[1])
 	}
-	return cmd
+	return out
 }
 
 func (s *Suite) runTerraformInit() ValidationResult {

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"tf-architect/internal/security"
 )
 
 // SessionData is the subset of state.Session needed for doc generation.
@@ -28,6 +30,9 @@ type ClarificationEntry struct {
 type Client interface {
 	Query(ctx context.Context, prompt string) (string, error)
 }
+
+// TaskHeader opens the docs prompt, like every other task prompt.
+const TaskHeader = "## TASK: DOCS"
 
 // agentsHeader opens the generated AGENTS.md. The file is written with real
 // values, so it must not be shared with an AI provider as is.
@@ -52,6 +57,14 @@ func GenerateArchitecturalDocs(ctx context.Context, client Client, sess SessionD
 	prompt := buildDocsPrompt(sess, project)
 	raw, err := client.Query(ctx, prompt)
 	if err != nil {
+		// AGENTS.md is always written; only a security stop or an interrupt
+		// ends the run before anything more is done.
+		var se *security.Error
+		if !errors.As(err, &se) && ctx.Err() == nil {
+			if werr := writeAgentsMD(outputDir, agentsBase, ""); werr == nil {
+				onStatus("  ✓ AGENTS.md (base rules only)")
+			}
+		}
 		return fmt.Errorf("architectural docs generation: %w", err)
 	}
 
@@ -98,11 +111,18 @@ func GenerateArchitecturalDocs(ctx context.Context, client Client, sess SessionD
 	if adocs.ProjectAgents == "" {
 		onStatus("  ⚠ the model returned no project section; AGENTS.md has only the base rules")
 	}
-	if err := os.WriteFile(filepath.Join(outputDir, "AGENTS.md"), []byte(buildAgentsMD(agentsBase, adocs.ProjectAgents)), 0644); err != nil {
-		return fmt.Errorf("writing AGENTS.md: %w", err)
+	if err := writeAgentsMD(outputDir, agentsBase, adocs.ProjectAgents); err != nil {
+		return err
 	}
 	onStatus("  ✓ AGENTS.md")
 
+	return nil
+}
+
+func writeAgentsMD(outputDir, base, project string) error {
+	if err := os.WriteFile(filepath.Join(outputDir, "AGENTS.md"), []byte(buildAgentsMD(base, project)), 0644); err != nil {
+		return fmt.Errorf("writing AGENTS.md: %w", err)
+	}
 	return nil
 }
 
@@ -127,7 +147,7 @@ func buildDocsPrompt(sess SessionData, project string) string {
 		decisions.WriteString("- **" + c.Question + "**: " + c.Answer + "\n")
 	}
 
-	return "## TASK: DOCS\n\n" + `You are a senior infrastructure architect writing documentation for a Terraform project.
+	return TaskHeader + "\n\n" + `You are a senior infrastructure architect writing documentation for a Terraform project.
 
 ## Source Document
 ` + sess.DocMarkdown + `

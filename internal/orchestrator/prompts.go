@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -128,8 +129,13 @@ type GenerationPlan struct {
 	Modules []ModulePlan `json:"modules"`
 }
 
-// ParseGenerationPlan parses the model's plan. A plan without modules or with
-// an unnamed module is an error. The root module is moved or appended last.
+// moduleNameRe is what a module name may hold: it becomes a task header, a
+// checkpoint and a status line, so no spaces, newlines or control characters.
+var moduleNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// ParseGenerationPlan parses the model's plan. A plan without modules, or
+// with a module whose name is invalid, duplicated or a reserved checkpoint
+// (review, adjust), is an error. The root module is moved or appended last.
 func ParseGenerationPlan(raw string) (GenerationPlan, error) {
 	var plan GenerationPlan
 	if err := json.Unmarshal([]byte(extractJSON(raw)), &plan); err != nil {
@@ -140,10 +146,21 @@ func ParseGenerationPlan(raw string) (GenerationPlan, error) {
 	}
 	var modules []ModulePlan
 	root := ModulePlan{Name: rootModule, Files: rootFiles}
+	seen := map[string]bool{}
 	for _, m := range plan.Modules {
 		if strings.TrimSpace(m.Name) == "" {
 			return GenerationPlan{}, errors.New("generation plan has a module without a name")
 		}
+		if !moduleNameRe.MatchString(m.Name) {
+			return GenerationPlan{}, fmt.Errorf("generation plan has an invalid module name %q (letters, digits, - and _ only)", m.Name)
+		}
+		if m.Name == reviewStep || m.Name == adjustStep {
+			return GenerationPlan{}, fmt.Errorf("generation plan uses the reserved module name %q", m.Name)
+		}
+		if seen[m.Name] {
+			return GenerationPlan{}, fmt.Errorf("generation plan lists module %q twice", m.Name)
+		}
+		seen[m.Name] = true
 		if m.Name == rootModule {
 			root = m
 			continue

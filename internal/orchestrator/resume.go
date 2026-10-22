@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -99,7 +100,8 @@ func DecideResume(docPath string, mgr *state.Manager, custom ...string) (*Resume
 func buildContextBlob(s *state.Session) string {
 	var sb strings.Builder
 	sb.WriteString("## SESSION CONTEXT\n\n")
-	sb.WriteString(fmt.Sprintf("Document: %s\n", s.DocPath))
+	// The name only: the absolute path can reveal user and directory names.
+	sb.WriteString(fmt.Sprintf("Document: %s\n", filepath.Base(s.DocPath)))
 	sb.WriteString(fmt.Sprintf("Last completed phase: %s\n", string(s.CurrentPhase)))
 	if s.LastCheckpoint.GenerateStep != "" {
 		sb.WriteString(fmt.Sprintf("Last checkpoint step: %s\n", s.LastCheckpoint.GenerateStep))
@@ -206,7 +208,7 @@ func computeMarkdownDiff(prevMarkdown, newDocPath string, prevMM masking.MaskMap
 		}
 	}
 
-	truncate := func(lines []string, max int) []string {
+	capLines := func(lines []string, max int) []string {
 		if len(lines) > max {
 			return append(lines[:max], fmt.Sprintf("... (%d more lines)", len(lines)-max))
 		}
@@ -216,13 +218,13 @@ func computeMarkdownDiff(prevMarkdown, newDocPath string, prevMM masking.MaskMap
 	var sb strings.Builder
 	if len(added) > 0 {
 		sb.WriteString("ADDED:\n")
-		for _, l := range truncate(added, 20) {
+		for _, l := range capLines(added, 20) {
 			sb.WriteString(fmt.Sprintf("  + %s\n", l))
 		}
 	}
 	if len(removed) > 0 {
 		sb.WriteString("REMOVED:\n")
-		for _, l := range truncate(removed, 20) {
+		for _, l := range capLines(removed, 20) {
 			sb.WriteString(fmt.Sprintf("  - %s\n", l))
 		}
 	}

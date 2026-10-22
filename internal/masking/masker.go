@@ -361,3 +361,21 @@ func (rule *maskRule) apply(text string, s *maskState) string {
 		return prefix + placeholder + suffix
 	})
 }
+
+// IsSensitive reports whether text holds a sensitive value: masking would
+// change it, or it contains a real value of mm (stored or fully resolved).
+// mm is not modified.
+func IsSensitive(text string, mm MaskMap) bool {
+	if masked, _, _ := Mask(text, mm); masked != text {
+		return true
+	}
+	for _, real := range mm {
+		if real == "" {
+			continue
+		}
+		if strings.Contains(text, real) || strings.Contains(text, UnmaskText(real, mm)) {
+			return true
+		}
+	}
+	return false
+}

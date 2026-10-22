@@ -2,20 +2,24 @@ package docs
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"tf-architect/internal/security"
 )
 
 type fakeClient struct {
 	resp   string
+	err    error
 	prompt string
 }
 
 func (f *fakeClient) Query(_ context.Context, prompt string) (string, error) {
 	f.prompt = prompt
-	return f.resp, nil
+	return f.resp, f.err
 }
 
 const allSections = `===BEGIN_ROOT_README===
@@ -107,5 +111,42 @@ func TestChangelogNotOverwritten(t *testing.T) {
 	run(t, &fakeClient{resp: allSections}, dir)
 	if b, _ := os.ReadFile(cl); string(b) != "mine" {
 		t.Errorf("changelog overwritten: %s", b)
+	}
+}
+
+func TestDocsQueryErrorStillWritesAgentsMD(t *testing.T) {
+	dir := t.TempDir()
+	c := &fakeClient{err: errors.New("HTTP 500")}
+	err := GenerateArchitecturalDocs(context.Background(), c, SessionData{}, dir, "BASE RULES", "P", unmaskCIDR, func(string) {})
+	if err == nil {
+		t.Fatal("query error must still be returned")
+	}
+	b, rerr := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if rerr != nil {
+		t.Fatalf("AGENTS.md not written: %v", rerr)
+	}
+	if !strings.HasPrefix(string(b), agentsHeader) || !strings.Contains(string(b), "BASE RULES") || strings.Contains(string(b), "## Project") {
+		t.Errorf("unexpected AGENTS.md:\n%s", b)
+	}
+}
+
+func TestDocsSecurityOrCancelDoesNotWriteAgentsMD(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for name, tc := range map[string]struct {
+		ctx context.Context
+		err error
+	}{
+		"security":  {context.Background(), security.New("masking failed", "why", "fix")},
+		"cancelled": {ctx, errors.New("request failed: context canceled")},
+	} {
+		dir := t.TempDir()
+		c := &fakeClient{err: tc.err}
+		if err := GenerateArchitecturalDocs(tc.ctx, c, SessionData{}, dir, "BASE", "P", unmaskCIDR, func(string) {}); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "AGENTS.md")); !os.IsNotExist(err) {
+			t.Errorf("%s: AGENTS.md written after a stop", name)
+		}
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"tf-architect/internal/fileproto"
+	"tf-architect/internal/masking"
 	"tf-architect/internal/orchestrator"
 	"tf-architect/internal/security"
 	"tf-architect/internal/state"
@@ -676,6 +677,9 @@ func TestReviewNoChanges(t *testing.T) {
 	if got := readFile(t, filepath.Join(outputDir, "main.tf")); !strings.Contains(got, "10.20.0.0/16") || strings.Contains(got, "# fixed") {
 		t.Errorf("main.tf changed by a NO_CHANGES review:\n%s", got)
 	}
+	if got := generateHeaders(p); len(got) == 0 || got[len(got)-1] != "REVIEW" {
+		t.Errorf("REVIEW not called: %v", got)
+	}
 }
 
 func TestDocChangedUsesAdjustThenReview(t *testing.T) {
@@ -728,7 +732,10 @@ func TestAutoFixUsesFixWithProject(t *testing.T) {
 		}
 		return fakeModel(system, prompt)
 	}}
-	_ = orchestrator.New(workDir, outputDir, "", p, false).Run(docPath)
+	// The stub keeps failing validate, so issues remain after the fix.
+	if err := orchestrator.New(workDir, outputDir, "", p, false).Run(docPath); err == nil || !strings.Contains(err.Error(), "validation issues remain") {
+		t.Fatalf("Run: want remaining validation issues, got %v", err)
+	}
 	if !strings.Contains(fixPrompt, "Validation errors:") || !strings.Contains(fixPrompt, "bad") {
 		t.Errorf("FIX prompt lacks the errors:\n%s", fixPrompt)
 	}
@@ -766,5 +773,206 @@ func TestOverBudgetStops(t *testing.T) {
 		if h == "ADJUST" || h == "FIX" {
 			t.Errorf("%s called despite the over-budget project", h)
 		}
+	}
+}
+
+// savedSession stores a session for docPath and returns the manager.
+func savedSession(t *testing.T, workDir, docPath string, sess *state.Session) *state.Manager {
+	t.Helper()
+	hash, err := state.HashDoc(docPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.DocPath, sess.DocHash = docPath, hash
+	mgr := state.NewManager(workDir)
+	if err := mgr.Save(sess); err != nil {
+		t.Fatal(err)
+	}
+	return mgr
+}
+
+func TestResumeFromAdjustStepOnlyReviews(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	savedSession(t, workDir, docPath, &state.Session{
+		CurrentPhase: state.PhaseGenerate, DocMarkdown: "# LLD", AnalysisJSON: `{"ready": true}`,
+		PreviousDocHash: "old", DiffSummary: "ADDED:\n  + cache\n",
+		LastCheckpoint: state.Checkpoint{Phase: state.PhaseGenerate, GenerateStep: "adjust"},
+	})
+	p := &fakeProvider{}
+	if err := orchestrator.New(workDir, outputDir, "", p, false).Run(docPath); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var got []string
+	for _, h := range p.headers() {
+		if h == "ADJUST" || h == "REVIEW" || h == "PLAN" || strings.HasPrefix(h, "MODULE ") {
+			got = append(got, h)
+		}
+	}
+	if !equal(got, []string{"REVIEW"}) {
+		t.Errorf("headers = %v, want only REVIEW", got)
+	}
+}
+
+func TestLegacyCheckpointWithoutPlanReplans(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	savedSession(t, workDir, docPath, &state.Session{
+		CurrentPhase: state.PhaseGenerate, DocMarkdown: "# LLD", AnalysisJSON: `{"ready": true}`,
+		LastCheckpoint: state.Checkpoint{Phase: state.PhaseGenerate, GenerateStep: "vpc"},
+	})
+	p := &fakeProvider{respond: planModel}
+	if err := orchestrator.New(workDir, outputDir, "", p, false).Run(docPath); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := []string{"PLAN", "MODULE vpc", "MODULE rds", "MODULE root", "REVIEW"}
+	if got := generateHeaders(p); !equal(got, want) {
+		t.Errorf("headers = %v, want %v", got, want)
+	}
+}
+
+func TestContextBlobHasNoAbsoluteDocPath(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	p := &fakeProvider{}
+	if err := orchestrator.New(workDir, outputDir, "", p, false).Run(docPath); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	sent := p.sent()
+	if strings.Contains(sent, filepath.Dir(docPath)) {
+		t.Error("a prompt carries the document's absolute path")
+	}
+	if !strings.Contains(sent, "Document: doc.md") {
+		t.Error("context blob lacks the document name")
+	}
+}
+
+func TestSensitiveModuleSourceSkipsTerraform(t *testing.T) {
+	tfLog := installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	if err := os.WriteFile(docPath, []byte("# LLD\n\nVPC 10.20.0.0/16, modules at git.corp.acme.com\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	p := &fakeProvider{respond: func(system, prompt string) string {
+		if strings.Contains(prompt, "## TASK: MODULE root") {
+			return fileBlock("main.tf", generatedTF+"module \"x\" {\n  source = \"git::https://HOST_001/x.git\"\n}\n")
+		}
+		return fakeModel(system, prompt)
+	}}
+	o := orchestrator.New(workDir, outputDir, "", p, false)
+	var status []string
+	o.OnStatus = func(s string) { status = append(status, s) }
+	if err := o.Run(docPath); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(readFile(t, filepath.Join(outputDir, "main.tf")), "git.corp.acme.com") {
+		t.Fatal("test setup: module source not de-masked")
+	}
+	if b, err := os.ReadFile(tfLog); err == nil && len(b) > 0 {
+		t.Errorf("terraform ran despite a sensitive module source:\n%s", b)
+	}
+	joined := strings.Join(status, "\n")
+	if !strings.Contains(joined, "– terraform init/validate") || !strings.Contains(joined, "golden-rules-audit") {
+		t.Errorf("terraform not reported skipped or later stages missing:\n%s", joined)
+	}
+}
+
+func TestPublicModuleSourceRunsTerraform(t *testing.T) {
+	tfLog := installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	p := &fakeProvider{respond: func(system, prompt string) string {
+		if strings.Contains(prompt, "## TASK: MODULE root") {
+			return fileBlock("main.tf", generatedTF+"module \"x\" {\n  source = \"terraform-aws-modules/vpc/aws\"\n}\n")
+		}
+		return fakeModel(system, prompt)
+	}}
+	if err := orchestrator.New(workDir, outputDir, "", p, false).Run(docPath); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if b, _ := os.ReadFile(tfLog); len(b) == 0 {
+		t.Error("terraform not run for a public module source")
+	}
+}
+
+func TestRunRestoresMaskedOutputDir(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	mgr := state.NewManager(workDir)
+	hash, _ := state.HashDoc(docPath)
+	mmPath := mgr.MaskMapPath(hash)
+	if err := masking.SaveMaskMap(mmPath, masking.MaskMap{"CIDR_PRIVATE_001": "10.20.0.0/16"}); err != nil {
+		t.Fatal(err)
+	}
+	savedSession(t, workDir, docPath, &state.Session{
+		CurrentPhase: state.PhaseDone, DocMarkdown: "# LLD\n\nVPC CIDR_PRIVATE_001\n", MaskMapPath: mmPath,
+	})
+	outside := filepath.Join(workDir, "outside.tf")
+	write := func(path, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(outputDir, "main.tf"), generatedTF)
+	write(filepath.Join(outputDir, "docs", "NOTES.md"), "net CIDR_PRIVATE_001, glued xCIDR_PRIVATE_001\n")
+	write(filepath.Join(outputDir, ".terraform", "m.tf"), "CIDR_PRIVATE_001\n")
+	write(outside, "CIDR_PRIVATE_001\n")
+	if err := os.Symlink(outside, filepath.Join(outputDir, "link.tf")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ { // idempotent
+		if err := orchestrator.New(workDir, outputDir, "", &fakeProvider{}, false).Run(docPath); err != nil {
+			t.Fatalf("Run %d: %v", i, err)
+		}
+	}
+	if got := readFile(t, filepath.Join(outputDir, "main.tf")); !strings.Contains(got, `cidr_block = "10.20.0.0/16"`) {
+		t.Errorf("main.tf not restored:\n%s", got)
+	}
+	if got := readFile(t, filepath.Join(outputDir, "docs", "NOTES.md")); got != "net 10.20.0.0/16, glued xCIDR_PRIVATE_001\n" {
+		t.Errorf("NOTES.md = %q", got)
+	}
+	for _, p := range []string{filepath.Join(outputDir, ".terraform", "m.tf"), outside} {
+		if got := readFile(t, p); got != "CIDR_PRIVATE_001\n" {
+			t.Errorf("%s modified: %q", p, got)
+		}
+	}
+}
+
+func TestInterruptDuringValidationRecordsNoRun(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	o := orchestrator.New(workDir, outputDir, "", &fakeProvider{}, false)
+	o.OnStatus = func(s string) {
+		if s == "Running validation suite..." {
+			o.Interrupt()
+		}
+	}
+	err := o.Run(docPath)
+	if !errors.Is(err, orchestrator.ErrInterrupted) {
+		t.Fatalf("want ErrInterrupted, got %v", err)
+	}
+	sess, _ := state.NewManager(workDir).FindByDocPath(docPath)
+	if sess == nil || len(sess.ValidationRuns) != 0 {
+		t.Errorf("validation run recorded while interrupted: %+v", sess)
+	}
+}
+
+func TestInterruptedProviderErrorIsErrInterrupted(t *testing.T) {
+	installTerraform(t, true)
+	workDir, docPath, outputDir := setupDoc(t)
+	var o *orchestrator.Orchestrator
+	p := &fakeProvider{fail: func(prompt string) error {
+		if strings.Contains(prompt, "## TASK: PLAN") {
+			o.Interrupt()
+			return errors.New("fake: request failed: context canceled")
+		}
+		return nil
+	}}
+	o = orchestrator.New(workDir, outputDir, "", p, false)
+	if err := o.Run(docPath); !errors.Is(err, orchestrator.ErrInterrupted) {
+		t.Fatalf("want ErrInterrupted, got %v", err)
 	}
 }

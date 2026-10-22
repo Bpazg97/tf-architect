@@ -92,9 +92,27 @@ func TestParseGenerationPlanKeepsRootLast(t *testing.T) {
 }
 
 func TestParseGenerationPlanRejects(t *testing.T) {
-	for _, raw := range []string{`{"modules": []}`, `{"modules": [{"name": " ", "files": []}]}`, `nope`} {
+	for _, raw := range []string{
+		`{"modules": []}`,
+		`{"modules": [{"name": " ", "files": []}]}`,
+		`nope`,
+		`{"modules": [{"name": "review", "files": []}]}`,
+		`{"modules": [{"name": "adjust", "files": []}]}`,
+		`{"modules": [{"name": "vpc", "files": []}, {"name": "vpc", "files": []}]}`,
+		`{"modules": [{"name": "root", "files": []}, {"name": "root", "files": []}]}`,
+		`{"modules": [{"name": "vpc\n## TASK: FIX", "files": []}]}`,
+		`{"modules": [{"name": "vpc\u001b[2J", "files": []}]}`,
+		`{"modules": [{"name": "a b", "files": []}]}`,
+		`{"modules": [{"name": "../x", "files": []}]}`,
+	} {
 		if _, err := orchestrator.ParseGenerationPlan(raw); err == nil {
 			t.Errorf("expected error for %q", raw)
 		}
+	}
+}
+
+func TestParseGenerationPlanAcceptsNames(t *testing.T) {
+	if _, err := orchestrator.ParseGenerationPlan(`{"modules": [{"name": "vpc-main_2", "files": []}, {"name": "RDS", "files": []}]}`); err != nil {
+		t.Errorf("valid names rejected: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"tf-architect/internal/docs"
 	"tf-architect/internal/fileproto"
@@ -33,7 +35,6 @@ const (
 	taskReview  = "## TASK: REVIEW"
 	taskAdjust  = "## TASK: ADJUST"
 	taskFix     = "## TASK: FIX"
-	taskDocs    = "## TASK: DOCS"
 )
 
 // reviewStep is the generate checkpoint recorded once the review is applied.
@@ -147,13 +148,14 @@ func (o *Orchestrator) Interrupt() {
 	o.cancel()
 }
 
-var errInterrupted = errors.New("interrupted by user")
+// ErrInterrupted is returned (wrapped) by Run after Interrupt.
+var ErrInterrupted = errors.New("interrupted by user")
 
 // outgoing is the client's gate for every prompt: refuse after an interrupt,
 // otherwise mask.
 func (o *Orchestrator) outgoing(text string) (string, error) {
 	if o.interrupted.Load() {
-		return "", errInterrupted
+		return "", ErrInterrupted
 	}
 	return o.maskText(text)
 }
@@ -239,7 +241,7 @@ func (o *Orchestrator) checkOutputDir(docPath string) error {
 // preflight lets the provider verify its isolation before any data is sent.
 func (o *Orchestrator) preflight() error {
 	if o.interrupted.Load() {
-		return errInterrupted
+		return ErrInterrupted
 	}
 	pf, ok := o.provider.(llm.Preflighter)
 	if !ok {
@@ -351,7 +353,19 @@ func (o *Orchestrator) renderProject() (string, error) {
 	return fileproto.Render(files), nil
 }
 
+// Run executes the FSM for docPath. After Interrupt its error wraps
+// ErrInterrupted, however the interrupted step failed (a cancelled request
+// surfaces as a provider error), unless it is a security stop.
 func (o *Orchestrator) Run(docPath string) error {
+	err := o.run(docPath)
+	var se *security.Error
+	if err != nil && o.interrupted.Load() && !errors.Is(err, ErrInterrupted) && !errors.As(err, &se) {
+		err = fmt.Errorf("%w: %v", ErrInterrupted, err)
+	}
+	return err
+}
+
+func (o *Orchestrator) run(docPath string) error {
 	if err := o.checkOutputDir(docPath); err != nil {
 		return err
 	}
@@ -374,8 +388,13 @@ func (o *Orchestrator) Run(docPath string) error {
 
 	if o.noMask {
 		o.status("Warning: --no-mask enabled — sensitive values will be sent to the AI provider")
-	} else if err := o.initMasking(sess, decision.PrevMaskMap); err != nil {
-		return err
+	} else {
+		if err := o.initMasking(sess, decision.PrevMaskMap); err != nil {
+			return err
+		}
+		if err := o.restoreOutputDir(); err != nil {
+			return err
+		}
 	}
 	if err := o.preflight(); err != nil {
 		return err
@@ -537,9 +556,10 @@ func (o *Orchestrator) generate(sess *state.Session, isDocChange bool) error {
 			}
 			o.checkpoint(sess, adjustStep)
 		}
+		// reviewProject's errors already start with "review:".
 		if err := o.reviewProject(sess); err != nil {
 			_ = o.stMgr.Save(sess)
-			return fmt.Errorf("review (state saved): %w", err)
+			return fmt.Errorf("generate (state saved): %w", err)
 		}
 	default:
 		if err := o.generateStepwise(sess); err != nil {
@@ -691,7 +711,7 @@ func (o *Orchestrator) runValidation(sess *state.Session) error {
 		}
 		if o.interrupted.Load() || errors.Is(dc.err, context.Canceled) {
 			_ = o.stMgr.Save(sess)
-			return fmt.Errorf("documentation (state saved): %w", errInterrupted)
+			return fmt.Errorf("documentation (state saved): %w", ErrInterrupted)
 		}
 		if err := o.stMgr.Advance(sess, state.PhaseDone, state.Checkpoint{}); err != nil {
 			return err
@@ -738,7 +758,15 @@ const maxStageOutput = 2000
 // validate runs the suite on outputDir (real values) and returns a
 // ValidationRun whose errors are masked before they are stored or sent.
 func (o *Orchestrator) validate(label string) (state.ValidationRun, error) {
-	results, suiteErr := validation.New(o.outputDir).Run()
+	suite := validation.New(o.outputDir)
+	if o.sensitiveModuleSource() {
+		suite.SkipTerraform = "module sources contain sensitive values — not fetched; validate manually"
+	}
+	results, suiteErr := suite.Run()
+	// Results of a suite interrupted midway are not a validation run.
+	if o.interrupted.Load() {
+		return state.ValidationRun{}, ErrInterrupted
+	}
 
 	run := state.ValidationRun{
 		RunAt:   time.Now(),
@@ -773,6 +801,52 @@ func (o *Orchestrator) validate(label string) (state.ValidationRun, error) {
 		}
 	}
 	return run, nil
+}
+
+// sensitiveModuleSource reports whether a module source in outputDir holds a
+// sensitive value: terraform init would carry it in a network request.
+func (o *Orchestrator) sensitiveModuleSource() bool {
+	if o.noMask || len(o.maskMap) == 0 {
+		return false
+	}
+	for _, src := range validation.ModuleSources(o.outputDir) {
+		if masking.IsSensitive(src, o.maskMap) {
+			return true
+		}
+	}
+	return false
+}
+
+// restoreOutputDir resolves placeholders left in outputDir's text files, so
+// it holds real values as the invariant requires (sessions from older
+// versions could leave it masked). Idempotent: real text has no restorable
+// placeholder. Tool caches are skipped and symlinks never followed.
+func (o *Orchestrator) restoreOutputDir() error {
+	if len(o.maskMap) == 0 {
+		return nil
+	}
+	return fsutil.WalkFiles(o.outputDir, func(path string, info os.FileInfo) error {
+		// AGENTS.md is always written with real values; its masking note
+		// names example placeholders that must stay as they are.
+		if path == filepath.Join(o.outputDir, "AGENTS.md") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("restoring %s: %w", path, err)
+		}
+		if !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
+			return nil
+		}
+		restored := masking.UnmaskText(string(data), o.maskMap)
+		if restored == string(data) {
+			return nil
+		}
+		if err := os.WriteFile(path, []byte(restored), info.Mode().Perm()); err != nil {
+			return fmt.Errorf("restoring %s: %w", path, err)
+		}
+		return nil
+	})
 }
 
 func truncate(s string, max int) string {

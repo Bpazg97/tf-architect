@@ -164,3 +164,24 @@ provider "aws" {
 		t.Errorf("third-party module code in .terraform audited: %v", r.Errors)
 	}
 }
+
+func TestModuleSourcesAndSkipTerraform(t *testing.T) {
+	dir := t.TempDir()
+	tf := "module \"a\" {\n  source = \"git::https://git.corp.example.com/a.git\"\n}\nmodule \"b\" {\n  source  = \"./modules/b\"\n}\n"
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(tf), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got := validation.ModuleSources(dir)
+	if strings.Join(got, ",") != "git::https://git.corp.example.com/a.git,./modules/b" {
+		t.Errorf("ModuleSources = %v", got)
+	}
+	s := validation.New(dir)
+	s.SkipTerraform = "not fetched"
+	results, _ := s.Run()
+	if len(results) == 0 || results[0].Stage != "terraform init/validate" || !results[0].Skipped || results[0].Output != "not fetched" {
+		t.Errorf("terraform not skipped: %+v", results)
+	}
+	if last := results[len(results)-1]; last.Stage != "golden-rules-audit" {
+		t.Errorf("later stages must still run, last = %s", last.Stage)
+	}
+}

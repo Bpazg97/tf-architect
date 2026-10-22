@@ -20,3 +20,9 @@ func TestWithMaskingNote(t *testing.T) {
 		t.Error("noMask must leave the prompt untouched")
 	}
 }
+
+func TestAgentsMaskedValuesSectionMatchesNote(t *testing.T) {
+	if !strings.Contains(prompts.Agents, strings.TrimSpace(maskingNote)) {
+		t.Error("AGENTS.md's MASKED VALUES section must contain maskingNote's text")
+	}
+}

@@ -434,3 +434,21 @@ func TestKnownValueInsideUnknownPlaceholderShapeIsMasked(t *testing.T) {
 		t.Errorf("known value inside unknown token sent unmasked: %q", masked)
 	}
 }
+
+func TestIsSensitive(t *testing.T) {
+	mm := masking.AddCustom(masking.MaskMap{"TAG_VALUE_001": "dev"}, []string{"phoenix"})
+	for in, want := range map[string]bool{
+		"git::https://git.corp.acme.com/x.git": true,  // pattern
+		"git::https://example.com/PHOENIX.git": true,  // custom, any case
+		"./modules/dev":                        true,  // known value
+		"terraform-aws-modules/vpc/aws":        false, // public registry
+		"./modules/vpc":                        false,
+	} {
+		if got := masking.IsSensitive(in, mm); got != want {
+			t.Errorf("IsSensitive(%q) = %v, want %v", in, got, want)
+		}
+	}
+	if len(mm) != 2 {
+		t.Errorf("IsSensitive modified the map: %v", mm)
+	}
+}

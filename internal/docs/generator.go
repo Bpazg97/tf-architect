@@ -8,7 +8,7 @@ import (
 )
 
 // Generate runs both documentation layers in the correct order:
-// 1. Architectural docs (Claude) — writes prefix + docs/ directory
+// 1. Architectural docs (the AI provider) — writes prefix + docs/ directory
 // 2. terraform-docs — injects technical docs into BEGIN_TF_DOCS markers
 // Both passes are best-effort: the IaC is usable even if docs fail.
 func Generate(ctx context.Context, client Client, sess *state.Session, outputDir, agentsBase, project string, unmask func(string) string, onStatus func(string)) {
