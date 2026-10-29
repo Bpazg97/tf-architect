@@ -114,3 +114,26 @@ func TestFindByDocPath(t *testing.T) {
 		t.Error("expected nil for unknown path")
 	}
 }
+
+func TestDeleteByDocPathRemovesAllVersions(t *testing.T) {
+	mgr := state.NewManager(t.TempDir())
+	for _, s := range []*state.Session{
+		{DocPath: "/a/doc.md", DocHash: "old"},
+		{DocPath: "/a/doc.md", DocHash: "new"},
+		{DocPath: "/a/other.md", DocHash: "keep"},
+	} {
+		if err := mgr.Save(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := mgr.DeleteByDocPath("/a/doc.md")
+	if err != nil || n != 2 {
+		t.Fatalf("DeleteByDocPath = %d, %v; want 2, nil", n, err)
+	}
+	if s, _ := mgr.FindByDocPath("/a/doc.md"); s != nil {
+		t.Error("session for doc still present")
+	}
+	if s, _ := mgr.Load("keep"); s == nil {
+		t.Error("unrelated session deleted")
+	}
+}

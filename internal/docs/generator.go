@@ -1,22 +1,22 @@
 package docs
 
 import (
+	"context"
 	"time"
 
 	"tf-architect/internal/state"
 )
 
 // Generate runs both documentation layers in the correct order:
-// 1. Architectural docs (Claude) — writes prefix + docs/ directory
+// 1. Architectural docs (the AI provider) — writes prefix + docs/ directory
 // 2. terraform-docs — injects technical docs into BEGIN_TF_DOCS markers
-func Generate(client Client, sess *state.Session, outputDir string, onStatus func(string)) error {
+// Both passes are best-effort: the IaC is usable even if docs fail.
+func Generate(ctx context.Context, client Client, sess *state.Session, outputDir, agentsBase, project string, unmask func(string) string, onStatus func(string)) {
 	onStatus("── Documentation ───────────────────────────")
 
-	// Build SessionData from state.Session (avoids import cycle)
 	sd := SessionData{
 		DocPath:        sess.DocPath,
 		DocMarkdown:    sess.DocMarkdown,
-		AnalysisJSON:   sess.AnalysisJSON,
 		GeneratedFiles: sess.GeneratedFiles,
 		CreatedAt:      sess.CreatedAt,
 	}
@@ -35,20 +35,17 @@ func Generate(client Client, sess *state.Session, outputDir string, onStatus fun
 	}
 
 	// Pass 1: architectural docs
-	if err := GenerateArchitecturalDocs(client, sd, outputDir, onStatus); err != nil {
+	if err := GenerateArchitecturalDocs(ctx, client, sd, outputDir, agentsBase, project, unmask, onStatus); err != nil {
 		onStatus("  ⚠ Architectural docs failed: " + err.Error())
-		// Continue — IaC is usable even if docs fail
 	}
 
 	// Pass 2: terraform-docs (technical)
 	onStatus("Running terraform-docs...")
-	_, err := RunTFDocs(outputDir)
-	if err != nil {
+	if _, err := RunTFDocs(outputDir); err != nil {
 		onStatus("  ⚠ terraform-docs: " + err.Error())
 		onStatus("  Install: https://terraform-docs.io/user-guide/installation/")
-		return nil // non-fatal
+		return
 	}
 	onStatus("  ✓ terraform-docs (variables/outputs/resources injected into README.md)")
 	onStatus("── Documentation complete ──────────────────")
-	return nil
 }

@@ -2,35 +2,57 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
+	"tf-architect/internal/fileproto"
+	"tf-architect/internal/llm"
+	"tf-architect/internal/masking"
 	"tf-architect/internal/orchestrator"
+	"tf-architect/internal/security"
 	"tf-architect/internal/state"
 	"tf-architect/internal/validation"
+	"tf-architect/prompts"
 )
 
 var (
 	outputDir  string
 	forceFlag  bool
-	systemFile string
+	agentsFile string
 	noMaskFlag bool
 	version    = "dev"
+
+	providerFlag  string
+	modelFlag     string
+	baseURLFlag   string
+	yesCustomFlag bool
+	claudeBin     string // test hook: path of the claude binary
 )
 
 // ── TUI styling ──────────────────────────────────────────────────────────────
 // Minimal ANSI styling. Disabled when stdout is not a TTY or NO_COLOR is set.
 
-var colorEnabled = func() bool {
-	if os.Getenv("NO_COLOR") != "" {
-		return false
-	}
-	fi, err := os.Stdout.Stat()
+var colorEnabled = os.Getenv("NO_COLOR") == "" && isTerminal(os.Stdout)
+
+// stdin is shared by every prompt: separate bufio readers on os.Stdin would
+// each buffer input the others never see. Tests replace it and
+// stdinIsTerminal so they never read the real stdin.
+var (
+	stdin           = bufio.NewReader(os.Stdin)
+	stdinIsTerminal = func() bool { return isTerminal(os.Stdin) }
+)
+
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
-}()
+}
 
 const (
 	ansiBold   = "1"
@@ -71,7 +93,11 @@ func main() {
 	root := &cobra.Command{
 		Use:     "tf-architect",
 		Version: version,
-		Short:   "Generate and validate production Terraform IaC from architecture documents",
+		// Runtime errors are not usage errors; main prints them itself
+		// (security stops as a pop-up), so cobra must not print them too.
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Short:         "Generate and validate production Terraform IaC from architecture documents",
 		Long: `tf-architect turns architecture documents (PDF, DOCX, MD, TXT) into
 production-grade AWS Terraform — and validates existing Terraform projects.
 
@@ -105,9 +131,17 @@ Sessions are persisted: interrupted runs resume from the last checkpoint.`,
 		Short: "Generate Terraform IaC from an architecture document",
 		Long: `Reads an architecture document and generates production-grade AWS Terraform.
 
-Claude analyses the document, asks clarifying questions when information is
-missing, then generates each Terraform module. After generation it runs the
-full validation suite and produces terraform-docs documentation.
+The AI model analyses the document, asks clarifying questions when information
+is missing, then generates each Terraform module. After generation it runs the
+best-effort validation suite and produces documentation. Sensitive values are
+masked before anything is sent to the provider.
+
+Providers (--provider): claude (default, uses your Claude Code login),
+anthropic, openai, gemini, openai-compatible. API keys come only from the
+environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, TFA_API_KEY.
+
+Exit codes: 0 ok, 1 error, 2 security stop (nothing sensitive was sent),
+130 interrupted (state saved; re-run to resume).
 
 Supported formats: PDF, DOCX, MD, TXT`,
 		Example: `  # Generate into the default output directory (<docname>-tf/)
@@ -119,14 +153,25 @@ Supported formats: PDF, DOCX, MD, TXT`,
   # Force a full re-run (discard saved session)
   tf-architect run architecture.pdf --force
 
-  # Use a custom system prompt / golden rules file
-  tf-architect run architecture.pdf --system-file ./my-rules.md`,
+  # Use a custom agents prompt / golden rules file
+  tf-architect run architecture.pdf --agents-file ./my-rules.md
+
+  # Use another provider
+  OPENAI_API_KEY=... tf-architect run architecture.pdf --provider openai --model <model>
+
+  # Self-hosted OpenAI-compatible endpoint
+  TFA_API_KEY=... tf-architect run architecture.pdf --provider openai-compatible \
+      --base-url https://llm.internal.example/v1 --model <model>`,
 		Args: cobra.ExactArgs(1),
 		RunE: runGenerate,
 	}
 	runCmd.Flags().StringVarP(&outputDir, "output", "o", "", "Output directory for Terraform files (default: <docname>-tf/)")
 	runCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force full re-run, ignoring saved session state")
-	runCmd.Flags().StringVar(&systemFile, "system-file", "", "Path to custom system prompt file (default: embedded golden rules)")
+	runCmd.Flags().StringVar(&agentsFile, "agents-file", "", "Path to custom agents prompt file (default: built-in golden rules)")
+	runCmd.Flags().StringVar(&providerFlag, "provider", "claude", "AI provider: claude, anthropic, openai, gemini, openai-compatible")
+	runCmd.Flags().StringVar(&modelFlag, "model", "", "Model name (required for openai, gemini and openai-compatible)")
+	runCmd.Flags().StringVar(&baseURLFlag, "base-url", "", "Override the provider endpoint (HTTPS, or http on localhost); required for openai-compatible")
+	runCmd.Flags().BoolVar(&yesCustomFlag, "yes-custom-endpoint", false, "Accept a non-local --base-url without asking (for non-interactive runs)")
 	runCmd.Flags().BoolVar(&noMaskFlag, "no-mask", false, "Disable sensitive value masking (debug only — never use in production)")
 
 	statusCmd := &cobra.Command{
@@ -180,9 +225,62 @@ The command exits with a non-zero status if any check fails.`,
 	}
 
 	root.AddCommand(runCmd, statusCmd, resetCmd, validateCmd)
-	if err := root.Execute(); err != nil {
-		os.Exit(1)
+	err := root.Execute()
+	os.Exit(reportError(os.Stderr, err, noMaskFlag))
+}
+
+// reportError prints err and returns the process exit code: a security stop
+// (anywhere in the chain) is shown as a pop-up and exits 2, a user interrupt
+// exits 130, any other error prints its message and exits 1.
+func reportError(w io.Writer, err error, noMask bool) int {
+	if err == nil {
+		return 0
 	}
+	var se *security.Error
+	if errors.As(err, &se) {
+		fmt.Fprint(w, renderPopup(se, noMask))
+		return 2
+	}
+	fmt.Fprintln(w, "Error: "+err.Error())
+	if errors.Is(err, orchestrator.ErrInterrupted) {
+		return 130
+	}
+	return 1
+}
+
+// confirmCustomEndpoint makes sure a non-local --base-url is a conscious
+// choice before any provider call: prompts are sent there. Without the flag
+// and without a terminal to ask on, it stops.
+func confirmCustomEndpoint(baseURL string, yes, interactive bool, in *bufio.Reader, out io.Writer) error {
+	if baseURL == "" {
+		return nil
+	}
+	local, err := llm.CheckBaseURL(baseURL)
+	if err != nil {
+		return err
+	}
+	if local || yes {
+		return nil
+	}
+	stop := func(what string) error {
+		return security.New(what,
+			"A custom endpoint receives your masked prompts and API key; sending them to an unintended host would expose them.",
+			"Check the URL, then re-run with --yes-custom-endpoint (or answer y when asked) to trust it.")
+	}
+	if !interactive {
+		return stop("Custom endpoint " + baseURL + " was not confirmed (non-interactive run).")
+	}
+	fmt.Fprintln(out, paint(ansiYellow, "┌─ Custom endpoint ─────────────────────────────────────────"))
+	fmt.Fprintln(out, paint(ansiYellow, "│ ")+"Prompts and your API key will be sent to:")
+	fmt.Fprintln(out, paint(ansiYellow, "│ ")+paint(ansiBold, baseURL))
+	fmt.Fprintln(out, paint(ansiYellow, "└───────────────────────────────────────────────────────────"))
+	fmt.Fprint(out, "Continue? [y/N] ")
+	line, _ := in.ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return nil
+	}
+	return stop("Custom endpoint " + baseURL + " was declined.")
 }
 
 func runGenerate(cmd *cobra.Command, args []string) error {
@@ -195,64 +293,162 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("document not found: %s", docPath)
 	}
 
-	workDir, _ := os.Getwd()
+	workDir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
 
 	if outputDir == "" {
 		base := strings.TrimSuffix(filepath.Base(docPath), filepath.Ext(docPath))
 		outputDir = filepath.Join(workDir, base+"-tf")
 	}
+	if outputDir, err = filepath.Abs(outputDir); err != nil {
+		return fmt.Errorf("resolving output path: %w", err)
+	}
 
-	// Force re-run: delete existing session
+	// Force re-run: delete every saved session for this document
 	if forceFlag {
-		hash, err := state.HashDoc(docPath)
-		if err == nil {
-			mgr := state.NewManager(workDir)
-			sessionDir := filepath.Join(mgr.BaseDir, hash)
-			if err := os.RemoveAll(sessionDir); err == nil {
-				fmt.Printf("Cleared session for %s\n", filepath.Base(docPath))
-			}
-		}
-	}
-
-	systemPrompt := embeddedSystemPrompt()
-	if systemFile != "" {
-		data, err := os.ReadFile(systemFile)
+		n, err := state.NewManager(workDir).DeleteByDocPath(docPath)
 		if err != nil {
-			return fmt.Errorf("reading system file: %w", err)
+			return fmt.Errorf("clearing sessions: %w", err)
 		}
-		systemPrompt = string(data)
+		if n > 0 {
+			fmt.Printf("Cleared session for %s\n", filepath.Base(docPath))
+		}
 	}
 
-	orch := orchestrator.New(workDir, outputDir, systemPrompt, noMaskFlag)
+	agents := prompts.Agents
+	if agentsFile != "" {
+		data, err := os.ReadFile(agentsFile)
+		if err != nil {
+			return fmt.Errorf("reading agents file: %w", err)
+		}
+		agents = string(data)
+	}
+
+	// Endpoint confirmation and provider construction happen before any
+	// provider call.
+	if err := confirmCustomEndpoint(baseURLFlag, yesCustomFlag, stdinIsTerminal(), stdin, os.Stdout); err != nil {
+		return err
+	}
+	provider, err := llm.New(llm.Config{
+		Provider:  providerFlag,
+		Model:     modelFlag,
+		BaseURL:   baseURLFlag,
+		ClaudeBin: claudeBin,
+	})
+	if err != nil {
+		return err
+	}
+
+	orch := orchestrator.New(workDir, outputDir, agents, provider, noMaskFlag)
 
 	fmt.Println(paint(ansiBold, "tf-architect ") + paint(ansiDim, version))
 	fmt.Println(paint(ansiDim, strings.Repeat("─", 45)))
 
-	orch.OnStatus = func(msg string) {
-		fmt.Println(styleStatus(msg))
+	if !noMaskFlag {
+		orch.CustomSensitive = askCustomSensitive()
 	}
 
-	orch.OnChunk = func(chunk string) {
-		fmt.Print(paint(ansiDim, chunk))
+	// The orchestrator already escapes control characters; escaping again
+	// here keeps the terminal safe whatever produced the text.
+	orch.OnStatus = func(msg string) {
+		fmt.Println(styleStatus(fileproto.Printable(msg)))
 	}
 
 	orch.OnQuestion = func(questions []string) []string {
 		fmt.Println("\n" + paint(ansiCyan, "── Clarification needed ─────────────────────"))
 		answers := make([]string, len(questions))
-		reader := bufio.NewReader(os.Stdin)
 		for i, q := range questions {
 			fmt.Printf("\n%s %s\n%s ",
 				paint(ansiCyan, fmt.Sprintf("[%d/%d]", i+1, len(questions))),
-				paint(ansiBold, q),
+				paint(ansiBold, fileproto.Printable(q)),
 				paint(ansiCyan, ">"))
-			answer, _ := reader.ReadString('\n')
+			answer, _ := stdin.ReadString('\n')
 			answers[i] = strings.TrimSpace(answer)
 		}
 		fmt.Println(paint(ansiCyan, "─────────────────────────────────────────────"))
 		return answers
 	}
 
+	stop := handleInterrupt(orch.Interrupt)
+	defer stop()
 	return orch.Run(docPath)
+}
+
+const customDisclaimer = `Automatic masking covers ARNs, account IDs, IPs/CIDRs, AWS resource IDs,
+hostnames, emails, bucket names and common tag values. List anything else you
+consider sensitive (client or project names, internal codenames, ...). Values
+are masked wherever they appear, ignoring case.
+
+DISCLAIMER: values you do not list may be sent to the AI provider. The author of
+tf-architect accepts no responsibility for data exposed through omission or
+negligence when providing this list.`
+
+// askCustomSensitive asks for extra sensitive values as value1,value2,value3.
+// "null" (the default) or an empty answer means none. Non-interactive runs
+// get none.
+func askCustomSensitive() []string {
+	if !stdinIsTerminal() {
+		fmt.Println(paint(ansiDim, "Custom sensitive values: none (non-interactive input)"))
+		return nil
+	}
+	fmt.Println("\n" + paint(ansiCyan, "── Custom sensitive values ──────────────────"))
+	fmt.Println(customDisclaimer)
+	fmt.Printf("\n%s %s ", paint(ansiBold, "Values (value1,value2,value3)"), paint(ansiDim, "[null]"))
+	line, _ := stdin.ReadString('\n')
+	values, short := parseCustomSensitive(line)
+	for _, v := range short {
+		fmt.Println(paint(ansiYellow, fmt.Sprintf("  ⚠ ignored %q: shorter than %d characters", v, masking.MinCustomLen)))
+	}
+	if len(values) == 0 {
+		fmt.Println(paint(ansiDim, "  No custom values."))
+	} else {
+		fmt.Println(paint(ansiGreen, fmt.Sprintf("  ✓ custom values to mask: %d", len(values))))
+	}
+	fmt.Println(paint(ansiCyan, "─────────────────────────────────────────────"))
+	return values
+}
+
+// parseCustomSensitive splits a comma-separated answer, dropping blanks and
+// "null". Values too short to mask safely are returned separately.
+func parseCustomSensitive(line string) (values, short []string) {
+	seen := make(map[string]bool)
+	for _, v := range strings.Split(line, ",") {
+		v = strings.TrimSpace(v)
+		if v == "" || strings.EqualFold(v, "null") || seen[v] {
+			continue
+		}
+		seen[v] = true
+		if len(v) < masking.MinCustomLen {
+			short = append(short, v)
+			continue
+		}
+		values = append(values, v)
+	}
+	return values, short
+}
+
+// handleInterrupt keeps the first Ctrl-C from killing the process outright:
+// onFirst cancels the in-flight request and stops further ones, so Run
+// returns normally with its state saved. A second Ctrl-C exits immediately.
+func handleInterrupt(onFirst func()) (stop func()) {
+	ch := make(chan os.Signal, 2)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		if _, ok := <-ch; !ok {
+			return
+		}
+		onFirst()
+		fmt.Fprintln(os.Stderr, paint(ansiYellow, "\nInterrupt received — cleaning up (press Ctrl-C again to force quit)"))
+		if _, ok := <-ch; ok {
+			os.Exit(130)
+		}
+	}()
+	return func() {
+		signal.Stop(ch)
+		close(ch)
+	}
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
@@ -260,15 +456,12 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolving document path: %w", err)
 	}
-	workDir, _ := os.Getwd()
-
-	hash, err := state.HashDoc(docPath)
+	workDir, err := os.Getwd()
 	if err != nil {
-		return fmt.Errorf("hashing document: %w", err)
+		return err
 	}
 
-	mgr := state.NewManager(workDir)
-	sess, err := mgr.Load(hash)
+	sess, err := state.NewManager(workDir).FindByDocPath(docPath)
 	if err != nil {
 		return err
 	}
@@ -308,17 +501,18 @@ func runReset(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolving document path: %w", err)
 	}
-	workDir, _ := os.Getwd()
-
-	hash, err := state.HashDoc(docPath)
+	workDir, err := os.Getwd()
 	if err != nil {
-		return fmt.Errorf("hashing document: %w", err)
+		return err
 	}
 
-	mgr := state.NewManager(workDir)
-	sessionDir := filepath.Join(mgr.BaseDir, hash)
-	if err := os.RemoveAll(sessionDir); err != nil {
+	n, err := state.NewManager(workDir).DeleteByDocPath(docPath)
+	if err != nil {
 		return fmt.Errorf("deleting session: %w", err)
+	}
+	if n == 0 {
+		fmt.Printf("No session found for %s\n", filepath.Base(docPath))
+		return nil
 	}
 	fmt.Printf("Session for %s cleared.\n", filepath.Base(docPath))
 	return nil
@@ -340,13 +534,19 @@ func runValidate(cmd *cobra.Command, args []string) error {
 	passed, failed := 0, 0
 	for _, r := range results {
 		icon := paint(ansiGreen, "✓")
-		if !r.Passed {
+		switch {
+		case r.Skipped:
+			icon = paint(ansiDim, "–")
+		case !r.Passed:
 			icon = paint(ansiRed, "✗")
 			failed++
-		} else {
+		default:
 			passed++
 		}
 		fmt.Printf("  %s  %s\n", icon, r.Stage)
+		if r.Skipped {
+			fmt.Printf("       %s\n", paint(ansiDim, r.Output))
+		}
 		for _, e := range r.Errors {
 			fmt.Printf("       %s\n", paint(ansiRed, e))
 		}
@@ -359,35 +559,10 @@ func runValidate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	summary := fmt.Sprintf("\n%s, %s\n",
-		paint(ansiGreen, fmt.Sprintf("%d passed", passed)),
-		paint(ansiRed, fmt.Sprintf("%d failed", failed)))
-	if failed == 0 {
-		summary = fmt.Sprintf("\n%s\n", paint(ansiGreen, fmt.Sprintf("%d passed, 0 failed", passed)))
+	failedText := fmt.Sprintf("%d failed", failed)
+	if failed > 0 {
+		failedText = paint(ansiRed, failedText)
 	}
-	fmt.Print(summary)
-	if runErr != nil {
-		return runErr
-	}
-	return nil
-}
-
-// embeddedSystemPrompt reads the system prompt from the prompts/ directory
-// relative to the binary location, falling back to a minimal inline version.
-func embeddedSystemPrompt() string {
-	// Try relative to working directory first (dev mode)
-	candidates := []string{
-		"prompts/system.md",
-		filepath.Join(filepath.Dir(os.Args[0]), "prompts/system.md"),
-	}
-	for _, path := range candidates {
-		if data, err := os.ReadFile(path); err == nil {
-			return string(data)
-		}
-	}
-	// Minimal fallback — golden rules inline
-	return `You are an expert AWS infrastructure engineer generating production-grade Terraform IaC.
-Always configure S3 backend, pin provider versions, use default_tags, encrypt all storage,
-never use 0.0.0.0/0 ingress, use least-privilege IAM, never hardcode secrets.
-After each module write: STEP_COMPLETE:<module_name>`
+	fmt.Printf("\n%s, %s\n", paint(ansiGreen, fmt.Sprintf("%d passed", passed)), failedText)
+	return runErr
 }

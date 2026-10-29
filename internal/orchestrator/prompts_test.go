@@ -58,12 +58,61 @@ func TestBuildQuestions(t *testing.T) {
 func TestBuildClarifyPrompt(t *testing.T) {
 	questions := []string{"What AWS region?", "What instance type?"}
 	answers := []string{"eu-west-1", "t3.medium"}
-	prompt := orchestrator.BuildClarifyPrompt(questions, answers)
+	prompt := orchestrator.BuildClarifyPrompt(`{"ready": false, "summary": "EKS cluster"}`, questions, answers)
 
 	if !strings.Contains(prompt, "eu-west-1") {
 		t.Error("clarify prompt should contain answers")
 	}
 	if !strings.Contains(prompt, "JSON") {
 		t.Error("clarify prompt should request JSON")
+	}
+	if !strings.Contains(prompt, "EKS cluster") {
+		t.Error("clarify prompt should include the previous analysis")
+	}
+}
+
+func TestParseGenerationPlanAppendsRoot(t *testing.T) {
+	plan, err := orchestrator.ParseGenerationPlan("```json\n{\"modules\": [{\"name\": \"vpc\", \"files\": [\"modules/vpc/main.tf\"]}]}\n```")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Modules) != 2 || plan.Modules[1].Name != "root" || len(plan.Modules[1].Files) != 6 {
+		t.Errorf("root not appended: %+v", plan)
+	}
+}
+
+func TestParseGenerationPlanKeepsRootLast(t *testing.T) {
+	plan, err := orchestrator.ParseGenerationPlan(`{"modules": [{"name": "root", "files": ["main.tf"]}, {"name": "vpc", "files": []}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Modules) != 2 || plan.Modules[0].Name != "vpc" || plan.Modules[1].Name != "root" || len(plan.Modules[1].Files) != 1 {
+		t.Errorf("root not kept last with its files: %+v", plan)
+	}
+}
+
+func TestParseGenerationPlanRejects(t *testing.T) {
+	for _, raw := range []string{
+		`{"modules": []}`,
+		`{"modules": [{"name": " ", "files": []}]}`,
+		`nope`,
+		`{"modules": [{"name": "review", "files": []}]}`,
+		`{"modules": [{"name": "adjust", "files": []}]}`,
+		`{"modules": [{"name": "vpc", "files": []}, {"name": "vpc", "files": []}]}`,
+		`{"modules": [{"name": "root", "files": []}, {"name": "root", "files": []}]}`,
+		`{"modules": [{"name": "vpc\n## TASK: FIX", "files": []}]}`,
+		`{"modules": [{"name": "vpc\u001b[2J", "files": []}]}`,
+		`{"modules": [{"name": "a b", "files": []}]}`,
+		`{"modules": [{"name": "../x", "files": []}]}`,
+	} {
+		if _, err := orchestrator.ParseGenerationPlan(raw); err == nil {
+			t.Errorf("expected error for %q", raw)
+		}
+	}
+}
+
+func TestParseGenerationPlanAcceptsNames(t *testing.T) {
+	if _, err := orchestrator.ParseGenerationPlan(`{"modules": [{"name": "vpc-main_2", "files": []}, {"name": "RDS", "files": []}]}`); err != nil {
+		t.Errorf("valid names rejected: %v", err)
 	}
 }
